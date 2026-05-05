@@ -1985,7 +1985,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def popLabelListMenu(self, point):
         '''作用：在标签列表区域右键点击时弹出右键菜单（用于修改标签等操作）。'''
+        index = self.labelList.indexAt(point)
+        if index.isValid() and not self.labelList.selectionModel().isSelected(index):
+            self.labelList.selectionModel().select(  # type: ignore[union-attr]
+                index,
+                QtCore.QItemSelectionModel.ClearAndSelect
+                | QtCore.QItemSelectionModel.Rows,
+            )
+        if not self.canvas.editing():
+            self.setEditMode()
+        self._sync_label_list_selection_to_canvas()
         self.menus.labelList.exec_(self.labelList.mapToGlobal(point))  # type: ignore[attr-defined]
+
+    def _sync_label_list_selection_to_canvas(self):
+        """把右侧标签列表的选中项同步到 canvas，并刷新编辑/删除 action 状态。"""
+        selected_shapes = []
+        for item in self.labelList.selectedItems():
+            if item is None:
+                continue
+            try:
+                shape = item.shape()
+            except Exception:
+                logger.exception("_sync_label_list_selection_to_canvas: 获取 item.shape() 时出错")
+                continue
+            if shape is not None:
+                selected_shapes.append(shape)
+
+        if selected_shapes:
+            self.canvas.selectShapes(selected_shapes)
+        else:
+            self.canvas.deSelectShape()
 
     def validateLabel(self, label):
         '''作用：根据配置判断输入标签是否合法。
@@ -2314,10 +2343,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     description=s.description,
                     shape_type=s.shape_type,
                     flags=s.flags,
-                    mask=None,
-                    line_width=line_width_to_save
+                    mask=None
                     if s.mask is None
                     else utils.img_arr_to_b64(s.mask.astype(np.uint8)),
+                    line_width=line_width_to_save,
                 )
             )
             return data
@@ -3400,6 +3429,10 @@ class MainWindow(QtWidgets.QMainWindow):
             如果删除后没有剩余图形（通过 self.noShapes() 判断），禁用所有与“有图形存在”相关的操作（遍历 self.actions.onShapesPresent 并禁用）。
             如果用户选择“No”，则操作取消，不执行删除。
         """
+        if not self.canvas.selectedShapes and self.labelList.selectedItems():
+            self._sync_label_list_selection_to_canvas()
+        if not self.canvas.selectedShapes:
+            return
         yes, no = QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No
         msg = self.tr(
             "You are about to permanently delete {} polygons, " "proceed anyway?"

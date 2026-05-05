@@ -8,6 +8,7 @@ from typing import Iterable, List, NamedTuple, Tuple
 
 import imgviz
 import numpy as np
+import skimage.measure
 from loguru import logger
 
 from labelme.label_file import LabelFile
@@ -103,6 +104,61 @@ def _load_image_array(label_file: LabelFile, image_path: str) -> np.ndarray:
     return np.array(pil_img.convert("RGB"))
 
 
+def _shape_to_full_mask(img_shape: tuple[int, ...], shape: dict) -> np.ndarray | None:
+    """将单个 shape 转成整图 bool mask；损坏的 mask shape 返回 None。"""
+    points = shape["points"]
+    shape_type = shape.get("shape_type", "polygon")
+    if shape_type != "mask":
+        return shape_utils.shape_to_mask(img_shape[:2], points, shape_type)  # type: ignore[attr-defined]
+
+    mask_data = shape.get("mask")
+    if not isinstance(mask_data, np.ndarray):
+        logger.warning(
+            "COCO 导出: 跳过损坏的 mask 标注 {}，mask 类型为 {}",
+            shape.get("label"),
+            type(mask_data).__name__,
+        )
+        return None
+
+    full_mask = np.zeros(img_shape[:2], dtype=bool)
+    (x1, y1), (x2, y2) = np.asarray(points).astype(int)
+    h, w = full_mask.shape[:2]
+    x1, x2 = sorted((max(0, x1), min(w - 1, x2)))
+    y1, y2 = sorted((max(0, y1), min(h - 1, y2)))
+    target_h = y2 - y1 + 1
+    target_w = x2 - x1 + 1
+    mask_data = mask_data.astype(bool)
+    if mask_data.shape[:2] != (target_h, target_w):
+        logger.warning(
+            "COCO 导出: 跳过尺寸不匹配的 mask 标注 {}，mask={} bbox={}",
+            shape.get("label"),
+            mask_data.shape[:2],
+            (target_h, target_w),
+        )
+        return None
+
+    full_mask[y1 : y2 + 1, x1 : x2 + 1] = mask_data
+    return full_mask
+
+
+def _mask_to_coco_polygons(mask: np.ndarray) -> list[list[float]]:
+    """从 bool mask 提取 COCO polygon segmentation。"""
+    polygons: list[list[float]] = []
+    padded = np.pad(mask.astype(np.uint8), pad_width=1, mode="constant")
+    contours = skimage.measure.find_contours(padded, 0.5)
+    height, width = mask.shape[:2]
+    for contour in contours:
+        contour = contour - 1
+        if len(contour) < 3:
+            continue
+        contour[:, 0] = np.clip(contour[:, 0], 0, height - 1)
+        contour[:, 1] = np.clip(contour[:, 1], 0, width - 1)
+        polygon = contour[:, ::-1].ravel().tolist()
+        if len(polygon) >= 6:
+            polygons.append([float(v) for v in polygon])
+    return polygons
+
+
 # ---------------------------------------------------------------------------
 # COCO 导出
 # ---------------------------------------------------------------------------
@@ -196,14 +252,19 @@ def export_to_coco(
                 group_id = shape.get("group_id")
                 shape_type = shape.get("shape_type", "polygon")
 
-                mask = shape_utils.shape_to_mask(img.shape[:2], points, shape_type)  # type: ignore[attr-defined]
+                mask = _shape_to_full_mask(img.shape, shape)
+                if mask is None:
+                    continue
                 if group_id is None:
                     group_id = uuid.uuid1()
 
                 instance = (label, group_id)
                 masks[instance] = masks.get(instance, mask) | mask
 
-                if shape_type == "rectangle":
+                if shape_type == "mask":
+                    segmentations[instance].extend(_mask_to_coco_polygons(mask))
+                    continue
+                elif shape_type == "rectangle":
                     (x1, y1), (x2, y2) = points
                     x1, x2 = sorted([x1, x2])
                     y1, y2 = sorted([y1, y2])
@@ -235,13 +296,17 @@ def export_to_coco(
                 rle = pycocotools.mask.encode(mask)
                 area = float(pycocotools.mask.area(rle))
                 bbox = pycocotools.mask.toBbox(rle).flatten().tolist()
+                segmentation = segmentations.get(instance, [])
+                if not segmentation:
+                    logger.warning("COCO 导出: 跳过无有效轮廓的标注 {}", cls_name)
+                    continue
 
                 coco_data["annotations"].append(
                     dict(
                         id=len(coco_data["annotations"]),
                         image_id=image_id,
                         category_id=cls_id,
-                        segmentation=segmentations[instance],
+                        segmentation=segmentation,
                         area=area,
                         bbox=bbox,
                         iscrowd=0,

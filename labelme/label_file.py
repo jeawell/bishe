@@ -112,21 +112,43 @@ class LabelFile(object):
                 data.get("imageHeight"),
                 data.get("imageWidth"),
             )
-            shapes = [
-                dict(
-                    label=s["label"],
-                    points=s["points"],
-                    shape_type=s.get("shape_type", "polygon"),
-                    flags=s.get("flags", {}),
-                    description=s.get("description"),
-                    group_id=s.get("group_id"),
-                    mask=utils.img_b64_to_arr(s["mask"]).astype(bool)
-                    if s.get("mask")
-                    else None,
-                    other_data={k: v for k, v in s.items() if k not in shape_keys},
+            shapes = []
+            for s in data["shapes"]:
+                mask = None
+                if s.get("mask"):
+                    mask = utils.img_b64_to_arr(s["mask"]).astype(bool)
+                elif (
+                    s.get("shape_type") == "mask"
+                    and isinstance(s.get("line_width"), str)
+                ):
+                    try:
+                        mask = utils.img_b64_to_arr(s["line_width"]).astype(bool)
+                        logger.warning(
+                            "Recovered legacy mask data stored in line_width: {}",
+                            filename,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to recover legacy mask data from line_width: {}",
+                            filename,
+                        )
+
+                other_data = {k: v for k, v in s.items() if k not in shape_keys}
+                if mask is not None and isinstance(other_data.get("line_width"), str):
+                    other_data.pop("line_width", None)
+
+                shapes.append(
+                    dict(
+                        label=s["label"],
+                        points=s["points"],
+                        shape_type=s.get("shape_type", "polygon"),
+                        flags=s.get("flags", {}),
+                        description=s.get("description"),
+                        group_id=s.get("group_id"),
+                        mask=mask,
+                        other_data=other_data,
+                    )
                 )
-                for s in data["shapes"]
-            ]
         except Exception as e:
             raise LabelFileError(e)
 

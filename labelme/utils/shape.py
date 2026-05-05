@@ -78,10 +78,26 @@ def shapes_to_label(img_shape, shapes, label_name_to_value):
         mask: npt.NDArray[np.bool_]
         if shape_type == "mask":
             if not isinstance(shape["mask"], np.ndarray):
-                raise ValueError("shape['mask'] must be numpy.ndarray")
+                logger.warning(
+                    "Skipping invalid mask shape {!r}: shape['mask'] is {}",
+                    label,
+                    type(shape.get("mask")).__name__,
+                )
+                continue
             mask = np.zeros(img_shape[:2], dtype=bool)
             (x1, y1), (x2, y2) = np.asarray(points).astype(int)
-            mask[y1 : y2 + 1, x1 : x2 + 1] = shape["mask"]
+            mask_data = shape["mask"].astype(bool)
+            target_h = y2 - y1 + 1
+            target_w = x2 - x1 + 1
+            if mask_data.shape[:2] != (target_h, target_w):
+                logger.warning(
+                    "Skipping invalid mask shape {!r}: mask size {} does not match bbox {}",
+                    label,
+                    mask_data.shape[:2],
+                    (target_h, target_w),
+                )
+                continue
+            mask[y1 : y2 + 1, x1 : x2 + 1] = mask_data
         else:
             mask = shape_to_mask(img_shape[:2], points, shape_type)
 
