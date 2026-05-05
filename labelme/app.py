@@ -6,6 +6,7 @@ import math
 import os
 import os.path as osp
 import re
+import shutil
 import webbrowser
 
 import imgviz
@@ -19,6 +20,11 @@ from PyQt5.QtCore import Qt
 
 from labelme import __appname__, shape
 from labelme._automation import bbox_from_text
+from labelme._automation import sam_patch
+from labelme._automation import polygon_from_mask as _polygon_from_mask
+
+# 在应用启动时立即打上补丁，确保所有 osam SAM 推理都使用可调阈值
+sam_patch.apply_patches()
 from labelme.config import get_config
 from labelme.label_file import LabelFile
 from labelme.label_file import LabelFileError
@@ -34,16 +40,60 @@ from labelme.widgets import ToolBar
 from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
 from labelme.widgets import Penwidget
+from labelme import export_dataset
 from . import utils
 
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
+# 将最大缩放值设置为足够大的数值，以支持“适应宽度/窗口”
 
 # TODO(unknown):
-# - Zoom is too "steppy".
+# - Zoom is too "steppy".缩放操作太“跳跃”，不够平滑
 
 # 定义标签颜色映射，用于给不同标签自动分配颜色
 LABEL_COLORMAP = imgviz.label_colormap()
+
+
+class _PathColumnDelegate(QtWidgets.QStyledItemDelegate):
+    """文件路径列专用：单元格只显示文件名，悬停显示完整路径，无省略号。"""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.textElideMode = Qt.ElideNone  # type: ignore[attr-defined]
+        # 只渲染文件名，完整路径留给 tooltip
+        full_path = index.data(Qt.DisplayRole)  # type: ignore[attr-defined]
+        if full_path:
+            option.text = osp.basename(full_path)
+
+class _AdaptiveSection(QtWidgets.QScrollArea):
+    """
+    工具栏区段容器：
+      - 区段 宽于 按钮总宽：内容自动拉伸至区段宽度，按钮均匀填充（Expanding 策略）
+      - 区段 窄于 按钮总宽：内容保持自然宽度，viewport 裁剪右侧溢出（按钮不压缩）
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._natural_width: int = 0
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)  # type: ignore[attr-defined]
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)  # type: ignore[attr-defined]
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)  # type: ignore[attr-defined]
+        self.setWidgetResizable(False)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        w = self.widget()
+        if w is None:
+            return
+        # 首次 resize 时确定按钮自然总宽（sizeHint 在此时已可靠）
+        if self._natural_width == 0:
+            self._natural_width = w.sizeHint().width()
+        if self._natural_width > 0:
+            target = max(self.viewport().width(), self._natural_width)
+            if w.width() != target:
+                w.setFixedWidth(target)
+
 
 # 主窗口类，继承自QtWidgets.QMainWindow
 class MainWindow(QtWidgets.QMainWindow):
@@ -133,7 +183,7 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
             labels=self._config["labels"],
             sort_labels=self._config["sort_labels"],
-            show_text_field=self._config["show_label_text_field"],
+            show_text_field=self._config["show_label_text_field"],#是否显示文本输入框
             completion=self._config["label_completion"],
             fit_to_content=self._config["fit_to_content"],
             flags=self._config["label_flags"],
@@ -199,8 +249,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fileSearch = QtWidgets.QLineEdit() # 文件搜索框
         self.fileSearch.setPlaceholderText(self.tr("Search Filename"))
         self.fileSearch.textChanged.connect(self.fileSearchChanged) # 文本改变时触发搜索
-        self.fileListWidget = QtWidgets.QListWidget() # 文件列表
-        self.fileListWidget.itemSelectionChanged.connect(self.fileSelectionChanged) # 选中文件时触发加载
+        # 文件列表改用 QTableWidget，五列：编号、选中复选框、文件路径、标注状态、已有标签
+        self.fileListWidget = QtWidgets.QTableWidget()
+        self.fileListWidget.setColumnCount(5)
+        self.fileListWidget.setHorizontalHeaderLabels([
+            self.tr("id"),      # 编号
+            self.tr(""),       # 复选框列
+            self.tr("文件路径"),
+            self.tr("标注状态"),
+            self.tr("已有标签"),
+        ])
+        # 列宽模式：编号/复选框固定，路径和标注状态可手动拖动，已有标签自动填满
+        header = self.fileListWidget.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Fixed)       # 编号：固定
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)       # 复选框：固定
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)  # 文件路径：可拖动
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Interactive)  # 标注状态：可拖动
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)      # 已有标签：填满剩余
+        header.setStretchLastSection(True)
+        self.fileListWidget.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.fileListWidget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.fileListWidget.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.fileListWidget.verticalHeader().setVisible(False)
+        self.fileListWidget.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        # 各列默认宽度
+        self.fileListWidget.setColumnWidth(0, 32)   # 编号（固定）
+        self.fileListWidget.setColumnWidth(1, 36)   # 复选框（固定）
+        self.fileListWidget.setColumnWidth(2, 160)  # 文件路径（可拖动）
+        self.fileListWidget.setColumnWidth(3, 56)   # 标注状态（可拖动）
+        # 第4列由 Stretch 自动填满，不需要手动设置
+        # 文件路径列不显示省略号，有多宽就显示多少字符
+        self.fileListWidget.setItemDelegateForColumn(2, _PathColumnDelegate(self.fileListWidget))
+        # 安装事件过滤器，处理 Ctrl+C 复制完整路径
+        self.fileListWidget.installEventFilter(self)
+        # 缩小字号，让路径尽量显示更多字符
+        table_font = self.fileListWidget.font()
+        table_font.setPointSize(max(8, table_font.pointSize() - 2))
+        self.fileListWidget.setFont(table_font)
+        # 行高也随之紧凑
+        self.fileListWidget.verticalHeader().setDefaultSectionSize(20)
+        self.fileListWidget.itemSelectionChanged.connect(self.fileSelectionChanged)
 
         # 创建一个垂直布局管理器（QVBoxLayout）
         fileListLayout = QtWidgets.QVBoxLayout()# 垂直布局会按从上到下的顺序排列子控件
@@ -208,9 +296,16 @@ class MainWindow(QtWidgets.QMainWindow):
         fileListLayout.setSpacing(0)# 设置布局内子控件之间的间距为0
         fileListLayout.addWidget(self.fileSearch)# 将文件搜索框控件添加到布局中
 
-        # 将文件列表控件添加到布局中
-        # 这会放在文件搜索框的下方
+        # 表头（放在搜索框下面，即现在文件列表从上到下是搜索框，表头，文件）
         fileListLayout.addWidget(self.fileListWidget)
+        # 底部计数标签（左对齐）
+        self.fileCountLabel = QtWidgets.QLabel(self.tr("共 0 张"))
+        self.fileCountLabel.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)  # type: ignore[attr-defined]
+        count_font = self.fileCountLabel.font()
+        count_font.setPointSize(max(8, count_font.pointSize() - 1))
+        self.fileCountLabel.setFont(count_font)
+        self.fileCountLabel.setContentsMargins(4, 2, 0, 2)
+        fileListLayout.addWidget(self.fileCountLabel)
         # 创建容纳文件列表的停靠窗口
         self.file_dock = QtWidgets.QDockWidget(self.tr("File List"), self)
         self.file_dock.setObjectName("Files")
@@ -257,6 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.drawingPolygon.connect(self.toggleDrawingSensitive)  # 正在绘制时
         self.canvas.contact_del_shape.connect(self.remLabels)  # 删除图形
         self.canvas.setDirty.connect(self.setDirty)  # 标记为已修改
+        self.canvas.rotationModeChanged.connect(self._onRotationModeChanged)  # 旋转模式切换
 
         # 将滚动区域设置为主窗口的中心控件
         self.setCentralWidget(scrollArea)
@@ -342,15 +438,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Save labels to file"),
             enabled=False,
         )
-        # 另存为
-        saveAs = action(
-            self.tr("&Save As"),
-            self.saveFileAs,
-            shortcuts["save_as"],
-            "save-as",
-            self.tr("Save labels to a different file"),
-            enabled=False,
-        )
         # 删除标签文件
         deleteFile = action(
             self.tr("&Delete File"),
@@ -369,25 +456,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Clear all shapes and brush strokes"),
             enabled=False,
         )
-        # 更改输出路径
-        changeOutputDir = action(
-            self.tr("&Change Output Dir"),
-            slot=self.changeOutputDirDialog,
-            shortcut=shortcuts["save_to"],
-            icon="open",
-            tip=self.tr("Change where annotations are loaded/saved"),
-        )
-
-        # 自动保存
+        # 自动保存：启用时图标+文字正常显示，关闭时整体变灰（利用 Qt setEnabled 原生效果）
         saveAuto = action(
             text=self.tr("Save &Automatically"),
-            slot=lambda x: self.actions.saveAuto.setChecked(x),  # type: ignore[attr-defined]
-            icon="save",
-            tip=self.tr("Save automatically"),
+            slot=None,
+            tip=self.tr("Auto-save labels when annotating"),
             checkable=True,
             enabled=True,
         )
+        saveAuto.setIcon(utils.newIcon("save"))
         saveAuto.setChecked(self._config["auto_save"])
+        saveAuto.setEnabled(self._config["auto_save"])
+
+        def _on_save_auto_toggled(checked):
+            # checked=True  → 正常显示（可见、可用）
+            # checked=False → Qt 原生灰显（图标+文字同步变灰）
+            saveAuto.setEnabled(checked)
+
+        saveAuto.toggled.connect(_on_save_auto_toggled)
 
         # 同时保存图像数据
         saveWithImageData = action(
@@ -446,6 +532,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Start drawing eraser"),
             enabled=False,
         )
+        # 旋转标注（R 键激活旋转模式）
+        rotateShape = action(
+            self.tr("旋转标注"),
+            self.canvas.toggleRotationMode,
+            None,
+            "rotate",  # 复用内置图标，无专属旋转图标时用此占位
+            self.tr("进入旋转模式 (R)：左键拖拽以围绕质心旋转选中的标注"),
+            enabled=False,
+            checkable=True,
+        )
+        # 导出 COCO 数据集
+        exportCoco = action(
+            self.tr("Export COCO"),
+            self._export_checked_to_coco,
+            None,
+            "save",
+            self.tr("Export checked images to COCO dataset"),
+            enabled=True,
+        )
+        # 导出 VOC 数据集
+        exportVoc = action(
+            self.tr("Export VOC"),
+            self._export_checked_to_voc,
+            None,
+            "save",
+            self.tr("Export checked images to VOC segmentation dataset"),
+            enabled=True,
+        )
         # 创建矩形
         createRectangleMode = action(
             self.tr("Create Rectangle"),
@@ -501,33 +615,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Start drawing ai_polygon. Ctrl+LeftClick ends creation."),
             enabled=False,
         )
-        # 创建ai模型
-        createAiPolygonMode.changed.connect(
-            lambda: self.canvas.initializeAiModel(
-                model_name=self._selectAiModelComboBox.itemData(  # type: ignore[has-type]
-                    self._selectAiModelComboBox.currentIndex()  # type: ignore[has-type]
-                )
-            )
-            if self.canvas.createMode == "ai_polygon"
-            else None
-        )
         # 创建ai蒙版
         createAiMaskMode = action(
             self.tr("Create AI-Mask"),
             lambda: self.toggleDrawMode(False, createMode="ai_mask"),
             None,
-            "AI",
+            "mb",
             self.tr("Start drawing ai_mask. Ctrl+LeftClick ends creation."),
             enabled=False,
         )
-        createAiMaskMode.changed.connect(
-            lambda: self.canvas.initializeAiModel(
-                model_name=self._selectAiModelComboBox.itemData(  # type: ignore[has-type]
-                    self._selectAiModelComboBox.currentIndex()  # type: ignore[has-type]
-                )
-            )
-            if self.canvas.createMode == "ai_mask"
-            else None
+
+        # 创建ai标注框
+        createAiBboxMode = action(
+            self.tr("创建AI多边形(框提示)"),
+            lambda: self.toggleDrawMode(False, createMode="ai_bbox"),
+            None,
+            "fk",
+            self.tr("Drag to draw a bounding box and get AI mask annotation."),
+            enabled=False,
         )
 
         # 编辑模式
@@ -830,9 +935,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions = utils.struct(  # type: ignore[assignment,method-assign]
             saveAuto=saveAuto,
             saveWithImageData=saveWithImageData,
-            changeOutputDir=changeOutputDir,
             save=save,
-            saveAs=saveAs,
             open=open_,
             close=close,
             deleteFile=deleteFile,
@@ -850,6 +953,9 @@ class MainWindow(QtWidgets.QMainWindow):
             editMode=editMode,
             createBrush=createBrush,
             createEraser=createEraser,
+            rotateShape=rotateShape,
+            exportCoco=exportCoco,
+            exportVoc=exportVoc,
             createRectangleMode=createRectangleMode,
             createCircleMode=createCircleMode,
             createLineMode=createLineMode,
@@ -857,6 +963,7 @@ class MainWindow(QtWidgets.QMainWindow):
             createLineStripMode=createLineStripMode,
             createAiPolygonMode=createAiPolygonMode,
             createAiMaskMode=createAiMaskMode,
+            createAiBboxMode=createAiBboxMode,
             zoom=zoom,
             zoomIn=zoomIn,
             zoomOut=zoomOut,
@@ -871,7 +978,7 @@ class MainWindow(QtWidgets.QMainWindow):
             zoomActions=zoomActions,
             openNextImg=openNextImg,
             openPrevImg=openPrevImg,
-            fileMenuActions=(open_, opendir, save, saveAs, close, quit),
+            fileMenuActions=(open_, opendir, save, close, quit),
             tool=(),
             # XXX: need to add some actions here to activate the shortcut
             editMenu=(
@@ -880,6 +987,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 copy,
                 paste,
                 delete,
+                None,
+                rotateShape,
                 None,
                 undo,
                 undoLastPoint,
@@ -901,6 +1010,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 # createAiPolygonMode,
                 # createAiMaskMode,
                 editMode,
+                None,
+                rotateShape,
+                None,
                 edit,
                 duplicate,
                 copy,
@@ -926,7 +1038,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 brightnessContrast,
                 clearAll,
             ),
-            onShapesPresent=(saveAs, hideAll, showAll, toggleAll),
+            onShapesPresent=(hideAll, showAll, toggleAll),
         )
         # 移除选中的点
         self.canvas.vertexSelected.connect(self.actions.removePoint.setEnabled)  # type: ignore[attr-defined]
@@ -951,6 +1063,7 @@ class MainWindow(QtWidgets.QMainWindow):
             file=self.menu(self.tr("&File")),
             edit=self.menu(self.tr("&Edit")),
             view=self.menu(self.tr("&View")),
+            tools=self.menu(self.tr("&Tools")),
             help=self.menu(self.tr("&Help")),
             recentFiles=QtWidgets.QMenu(self.tr("Open &Recent")),
             labelList=labelMenu,
@@ -966,9 +1079,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 opendir,
                 self.menus.recentFiles,  # type: ignore[attr-defined]
                 save,
-                saveAs,
                 saveAuto,
-                changeOutputDir,
                 saveWithImageData,
                 close,
                 deleteFile,
@@ -1003,8 +1114,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
             ),
         )
+        # Tools 菜单：导出数据集
+        utils.addActions(
+            self.menus.tools,  # type: ignore[attr-defined]
+            (
+                exportCoco,
+                exportVoc,
+            ),
+        )
 
         self.menus.file.aboutToShow.connect(self.updateFileMenu)  # type: ignore[attr-defined]
+        # 允许点击灰显的 saveAuto 菜单项来重新启用自动保存
+        self.menus.file.installEventFilter(self)  # type: ignore[attr-defined]
 
         # 为画布添加右键菜单
         # Custom context menu for the canvas widget:
@@ -1069,6 +1190,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 创建并填充工具栏
         self.tools = self.toolbar("Tools")
+
+        # 创建参数调节滑块（在 populateModeActions 之前构建，避免重复创建）
+        self._logit_container, self._logit_slider, self._logit_value_lbl = (
+            self._create_param_slider(
+                name="像素阈值",
+                min_val=-5.0, max_val=5.0,
+                default_val=0.0, step=0.1,
+                fmt="{:+.1f}",
+                callback=sam_patch.set_logit_threshold,
+            )
+        )
+        self._rdp_container, self._rdp_slider, self._rdp_value_lbl = (
+            self._create_param_slider(
+                name="多边形精度",
+                min_val=0.001, max_val=0.030,
+                default_val=0.004, step=0.001,
+                fmt="{:.3f}",
+                callback=_polygon_from_mask.set_rdp_factor,
+            )
+        )
         # self.actions.tool = (  # type: ignore[attr-defined]
         #     open_,
         #     opendir,
@@ -1100,25 +1241,21 @@ class MainWindow(QtWidgets.QMainWindow):
             # deleteFile,
             clearAll,
             None,
+            editMode,
             createMode,
             createBrush,
             createEraser,
-            createPointMode,
-            createLineMode,
-            createLineStripMode,
             createRectangleMode,
-            createCircleMode,
+            # createPointMode,
+            # createLineMode,
+            # createLineStripMode,
+            # createCircleMode,
             # createAiMaskMode,
             # createAiPolygonMode,
             None,
             brightnessContrast,
             fitWindow,
-            zoom,
-            pen,
-            eraser,
-            poly,
             None,
-            # None,
             # ai_prompt_action,
         )
 
@@ -1167,6 +1304,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.importDirImages(filename, load=False)
         else:
             self.filename = filename
+            # 启动时传入单张图片，也添加到文件列表
+            if filename is not None and osp.isfile(filename):
+                self._add_file_row_to_table(filename)
 
         if config["file_search"]:
             self.fileSearch.setText(config["file_search"])
@@ -1226,13 +1366,202 @@ class MainWindow(QtWidgets.QMainWindow):
         toolbar.setObjectName("%sToolBar" % title)
         # toolbar.setOrientation(Qt.Vertical)
         toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)  # type: ignore[attr-defined]
+        toolbar.setIconSize(QtCore.QSize(36, 36))
+        small_font = toolbar.font()
+        small_font.setPointSize(9)
+        toolbar.setFont(small_font)
         if actions:
             utils.addActions(toolbar, actions)
         # 将工具栏添加到主窗口
         # self.addToolBar() 是 QMainWindow 的一个标准方法。
         # Qt.TopToolBarArea 指定了工具栏的停靠区域在窗口的顶部。
+        toolbar.setFixedHeight(100)
         self.addToolBar(Qt.TopToolBarArea, toolbar)  # type: ignore[attr-defined]
         return toolbar
+
+    def _create_param_slider(self, name, min_val, max_val, default_val, step, fmt, callback):
+        """
+        创建一个供工具栏 QSplitter 区段使用的参数滑块控件。
+        返回 (QWidget_container, QSlider, QLabel_value) 三元组。
+
+        布局（垂直，紧凑）：
+            [  名称标签  ]
+            [slider ──●──] [当前值]
+        """
+        container = QtWidgets.QWidget()
+        v_layout = QtWidgets.QVBoxLayout(container)
+        v_layout.setContentsMargins(6, 2, 6, 2)
+        v_layout.setSpacing(1)
+
+        small_font = QtGui.QFont()
+        small_font.setPointSize(7)
+
+        name_lbl = QtWidgets.QLabel(name)
+        name_lbl.setAlignment(QtCore.Qt.AlignCenter)  # type: ignore[attr-defined]
+        name_lbl.setFont(small_font)
+
+        row = QtWidgets.QWidget()
+        h_layout = QtWidgets.QHBoxLayout(row)
+        h_layout.setContentsMargins(0, 0, 0, 0)
+        h_layout.setSpacing(4)
+
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)  # type: ignore[attr-defined]
+        int_min = round(min_val / step)
+        int_max = round(max_val / step)
+        int_default = round(default_val / step)
+        slider.setMinimum(int_min)
+        slider.setMaximum(int_max)
+        slider.setValue(int_default)
+        slider.setFixedWidth(90)
+        slider.setFixedHeight(16)
+
+        value_lbl = QtWidgets.QLabel(fmt.format(default_val))
+        value_lbl.setFont(small_font)
+        value_lbl.setFixedWidth(50)  # 足够显示 "+0.050" / "0.030" 完整数值
+        value_lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)  # type: ignore[attr-defined]
+
+        h_layout.addWidget(slider)
+        h_layout.addWidget(value_lbl)
+
+        v_layout.addWidget(name_lbl)
+        v_layout.addWidget(row)
+
+        def on_change(int_val, _step=step, _fmt=fmt, _cb=callback, _lbl=value_lbl):
+            real_val = int_val * _step
+            _lbl.setText(_fmt.format(real_val))
+            _cb(real_val)
+
+        slider.valueChanged.connect(on_change)
+
+        return container, slider, value_lbl
+
+    def _build_toolbar_splitter(self, sections: list) -> QtWidgets.QSplitter:
+        """
+        将各区段封装进横向 QSplitter：
+          - splitter 撑满工具栏全部宽度，随窗口伸缩
+          - 手柄可拖拽，动态重新分配各区段宽度
+          - 工具按钮区段用 QScrollArea（禁滚动条）：区段变窄时右侧按钮被
+            viewport 裁剪消失，变宽时重新出现；按钮始终保持原始尺寸不压缩
+          - 参数调节区段用普通 QWidget，滑块随区段宽度自然伸缩
+
+        sections: List[List[QAction | QWidget]]
+            最后一个 section 被视为参数调节区（元素为 QWidget）。
+        """
+        class _FlexSection(QtWidgets.QScrollArea):
+            """宽于内容时按钮均匀填满；窄于内容时右侧裁剪。"""
+            def resizeEvent(self_s, event):  # noqa: N805
+                super(_FlexSection, self_s).resizeEvent(event)
+                w = self_s.widget()
+                if w is None or w.layout() is None:
+                    return
+                vw = self_s.viewport().width()
+                natural_w = w.layout().sizeHint().width()
+                w.setFixedWidth(max(vw, natural_w))
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)  # type: ignore[attr-defined]
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(5)
+        splitter.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,    # type: ignore[attr-defined]
+            QtWidgets.QSizePolicy.Preferred,    # type: ignore[attr-defined]
+        )
+        splitter.setStyleSheet(
+            "QSplitter { background: transparent; }"
+            "QSplitter::handle { background: palette(mid); }"
+            "QSplitter::handle:hover { background: palette(highlight); }"
+        )
+
+        btn_font = QtGui.QFont()
+        btn_font.setPointSize(9)
+
+        for i, section_items in enumerate(sections):
+            is_param_section = (i == len(sections) - 1)
+
+            if is_param_section:
+                # ── 参数调节区：左对齐，尾部 stretch 防止控件撑满整个区段 ──
+                container = QtWidgets.QWidget()
+                container.setStyleSheet("background: transparent;")
+                container.setMinimumWidth(20)
+                layout = QtWidgets.QHBoxLayout(container)
+                layout.setSpacing(8)
+                layout.setContentsMargins(4, 0, 4, 0)
+                layout.setAlignment(  # type: ignore[call-overload]
+                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter  # type: ignore[attr-defined]
+                )
+                for item in section_items:
+                    if isinstance(item, QtWidgets.QWidget):
+                        layout.addWidget(item)
+                        # QWidgetAction.setDefaultWidget() 内部会显式 hide() 控件，
+                        # layout.addWidget 不覆盖显式隐藏标志，必须手动 show()
+                        item.show()
+                layout.addStretch(1)   # 剩余空间留白，控件靠左堆叠
+                splitter.addWidget(container)
+
+            else:
+                # ── 工具按钮区：_AdaptiveSection 负责"宽时拉伸、窄时裁剪" ──
+                content = QtWidgets.QWidget()
+                content.setStyleSheet("background: transparent;")
+                content_layout = QtWidgets.QHBoxLayout(content)
+                content_layout.setSpacing(0)
+                content_layout.setContentsMargins(0, 0, 0, 0)
+                for item in section_items:
+                    if item is None or isinstance(item, QtWidgets.QWidget):
+                        continue
+                    if isinstance(item, QtWidgets.QWidgetAction):
+                        # QWidgetAction 直接取出其内嵌控件放入布局
+                        w = item.defaultWidget()
+                        if w is not None:
+                            content_layout.addWidget(w)
+                    else:
+                        btn = QtWidgets.QToolButton()
+                        btn.setDefaultAction(item)
+                        btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)  # type: ignore[attr-defined]
+                        btn.setIconSize(QtCore.QSize(20, 20))
+                        btn.setFont(btn_font)
+                        btn.setStyleSheet("""
+                            QToolButton {
+                                border: 1px solid transparent;
+                                border-radius: 4px;
+                                padding: 3px 5px;
+                                background-color: transparent;
+                            }
+                            QToolButton:hover {
+                                background-color: rgba(100, 170, 230, 0.25);
+                                border: 1px solid rgba(100, 170, 230, 0.55);
+                            }
+                            QToolButton:pressed {
+                                background-color: rgba(70, 140, 200, 0.40);
+                                border: 1px solid rgba(70, 140, 200, 0.75);
+                            }
+                            QToolButton:checked {
+                                background-color: rgba(70, 140, 200, 0.30);
+                                border: 1px solid rgba(70, 140, 200, 0.65);
+                            }
+                        """)
+                        # Expanding：区段宽时按钮均匀填充；配合 _AdaptiveSection
+                        # 保证内容不会窄于自然宽度，所以按钮不会被压缩
+                        btn.setSizePolicy(
+                            QtWidgets.QSizePolicy.Expanding,    # type: ignore[attr-defined]
+                            QtWidgets.QSizePolicy.Fixed,        # type: ignore[attr-defined]
+                        )
+                        content_layout.addWidget(btn)
+
+                scroll = _FlexSection()
+                scroll.setFrameShape(QtWidgets.QFrame.NoFrame)  # type: ignore[attr-defined]
+                scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)  # type: ignore[attr-defined]
+                scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)  # type: ignore[attr-defined]
+                scroll.setWidgetResizable(False)
+                scroll.setWidget(content)
+                scroll.setAlignment(  # type: ignore[call-overload]
+                    QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter  # type: ignore[attr-defined]
+                )
+                scroll.setStyleSheet("background: transparent; border: none;")
+                scroll.viewport().setStyleSheet("background: transparent;")
+                scroll.setMinimumWidth(20)
+
+                splitter.addWidget(scroll)
+
+        return splitter
 
     # Support Functions
 
@@ -1249,8 +1578,54 @@ class MainWindow(QtWidgets.QMainWindow):
         向工具栏、画布菜单和编辑菜单中添加预定义的绘图和编辑操作（如绘制矩形、圆形、线条、AI辅助模式等）。
         '''
         tool, menu = self.actions.tool, self.actions.menu  # type: ignore[attr-defined]
+
+        # 在 clear() 之前先把所有复用控件 reparent 到主窗口，防止随 toolbar 一起被销毁
+        for wa in (
+            self.actions.zoom,          # type: ignore[attr-defined]
+            self.actions.pen,           # type: ignore[attr-defined]
+            self.actions.eraserWidth,   # type: ignore[attr-defined]
+            self.actions.shapeWidth,    # type: ignore[attr-defined]
+        ):
+            w = wa.defaultWidget()
+            if w is not None:
+                w.setParent(self)
+        self._logit_container.setParent(self)
+        self._rdp_container.setParent(self)
+
         self.tools.clear()
-        utils.addActions(self.tools, tool)
+
+        # 将 actions.tool 按 None 分隔符拆分成多个区段
+        sections: list = []
+        current: list = []
+        for act in tool:
+            if act is None:
+                if current:
+                    sections.append(current)
+                    current = []
+            else:
+                current.append(act)
+        if current:
+            sections.append(current)
+
+        # 参数调节区作为最后一个区段（直接放 QWidget）
+        # 将滑块类 QWidgetAction 的内嵌控件也并入此区段
+        param_widgets = []
+        for wa in (
+            self.actions.zoom,          # type: ignore[attr-defined]
+            self.actions.pen,           # type: ignore[attr-defined]
+            self.actions.eraserWidth,   # type: ignore[attr-defined]
+            self.actions.shapeWidth,    # type: ignore[attr-defined]
+        ):
+            w = wa.defaultWidget()
+            if w is not None:
+                param_widgets.append(w)
+        param_widgets += [self._logit_container, self._rdp_container]
+        sections.append(param_widgets)
+
+        # 用 addWidget() 直接挂载 splitter，使其能随工具栏宽度自适应伸缩
+        splitter = self._build_toolbar_splitter(sections)
+        self.tools.addWidget(splitter)
+
         self.canvas.menus[0].clear()
         utils.addActions(self.canvas.menus[0], menu)
         self.menus.edit.clear()  # type: ignore[attr-defined]
@@ -1265,6 +1640,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.actions.createLineStripMode,  # type: ignore[attr-defined]
             self.actions.createAiPolygonMode,  # type: ignore[attr-defined]
             self.actions.createAiMaskMode,  # type: ignore[attr-defined]
+            self.actions.createAiBboxMode,  # type: ignore[attr-defined]
             self.actions.editMode,  # type: ignore[attr-defined]
         )
         utils.addActions(self.menus.edit, actions + self.actions.editMenu)  # type: ignore[attr-defined]
@@ -1281,10 +1657,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Even if we autosave the file, we keep the ability to undo
         self.actions.undo.setEnabled(self.canvas.isShapeRestorable)  # type: ignore[attr-defined]
         if self._config["auto_save"] or self.actions.saveAuto.isChecked():  # type: ignore[attr-defined]
-            label_file = osp.splitext(self.imagePath)[0] + ".json"  # type: ignore[arg-type]
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
+            label_file = self._get_label_json_path(self.imagePath)  # type: ignore[arg-type]
             self.saveLabels(label_file)
             return
         self.dirty = True
@@ -1313,6 +1686,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.createLineStripMode.setEnabled(True)  # type: ignore[attr-defined]
         self.actions.createAiPolygonMode.setEnabled(True)  # type: ignore[attr-defined]
         self.actions.createAiMaskMode.setEnabled(True)  # type: ignore[attr-defined]
+        self.actions.createAiBboxMode.setEnabled(True)  # type: ignore[attr-defined]
         title = __appname__
         if self.filename is not None:
             title = "{} - {}".format(title, self.filename)
@@ -1417,6 +1791,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.labelFile = None
         self.otherData = None
         self.canvas.resetState()
+        # 重置为编辑模式，恢复默认光标（避免上一张图片的绘制模式残留）
+        #if hasattr(self, "actions") and hasattr(self.actions, "createMode"):
+           # self.setEditMode()
 
     def currentItem(self):
         '''作用：返回当前选中的标签项（用于修改、删除等操作）。'''
@@ -1468,6 +1845,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "linestrip": self.actions.createLineStripMode,
             "ai_polygon": self.actions.createAiPolygonMode,
             "ai_mask": self.actions.createAiMaskMode,
+            "ai_bbox": self.actions.createAiBboxMode,
             "pen": self.actions.createBrush,
             "eraser": self.actions.createEraser,
         }
@@ -1494,6 +1872,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 draw_action.setEnabled(createMode != draw_mode)
 
         self.actions.editMode.setEnabled(not edit)
+
+        # 如果切换到 AI 模式（ai_polygon / ai_mask），立刻初始化当前选中的 AI 模型
+        if (not edit) and createMode in ["ai_polygon", "ai_mask", "ai_bbox"]:
+            if hasattr(self, "_selectAiModelComboBox"):
+                model_name = self._selectAiModelComboBox.itemData(
+                    self._selectAiModelComboBox.currentIndex()
+                )
+                self.canvas.initializeAiModel(model_name=model_name)
 
     def setEditMode(self):
         '''作用：快捷切换为“编辑模式”。'''
@@ -1654,10 +2040,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def fileSelectionChanged(self):
         """当文件列表中选中项改变时，加载对应的文件"""
-        items = self.fileListWidget.selectedItems()
-        if not items:
+        row = self.fileListWidget.currentRow()
+        if row < 0:
             return
-        item = items[0]
+        path_item = self.fileListWidget.item(row, 2)
+        if not path_item:
+            return
+        filename = path_item.text()
         if not (self._openNextImg or self._openPrevImg):
             if not self.mayContinue():
                 print("fileSelectionChanged的mayContinue()")
@@ -1666,11 +2055,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._openNextImg = False
         if self._openPrevImg:
             self._openPrevImg = False
-        currIndex = self.imageList.index(str(item.text()))
-        if currIndex < len(self.imageList):
-            filename = self.imageList[currIndex]
-            if filename:
-                self.loadFile(filename)
+        if filename in self.imageList:
+            self.loadFile(filename)
 
     # React to canvas signals.
     def shapeSelectionChanged(self, selected_shapes):
@@ -1691,6 +2077,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.duplicate.setEnabled(n_selected)  # type: ignore[attr-defined]
         self.actions.copy.setEnabled(n_selected)  # type: ignore[attr-defined]
         self.actions.edit.setEnabled(n_selected)  # type: ignore[attr-defined]
+        # 有可旋转的图形（非 mask / circle / point）才启用旋转 action
+        _UNROTATABLE = ('mask', 'circle', 'point')
+        can_rotate = any(s.shape_type not in _UNROTATABLE for s in selected_shapes)
+        self.actions.rotateShape.setEnabled(can_rotate)  # type: ignore[attr-defined]
+
+    def _onRotationModeChanged(self, active: bool) -> None:
+        """旋转模式切换时同步 action 的 checked 状态，并更新状态栏提示."""
+        self.actions.rotateShape.setChecked(active)  # type: ignore[attr-defined]
+        if active:
+            self.status(self.tr("旋转模式已开启 — 鼠标左键按住标注拖动即可旋转，再按 R 或 Esc 退出"))
+        else:
+            self.status(self.tr("旋转模式已关闭"))
 
 
     def addLabel(self, shape):
@@ -1708,6 +2106,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.uniqLabelList.setItemLabel(item, shape.label, rgb)
             self.uniqLabelList.undate()
         self.labelDialog.addLabelHistory(shape.label)
+        # 同步新标签到 label.txt
+        self._append_label_to_txt(self.imagePath, shape.label)
         for action in self.actions.onShapesPresent:  # type: ignore[attr-defined]
             action.setEnabled(True)
 
@@ -1858,6 +2258,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         has_annotations = has_shapes or has_brush
 
+        # 无标注时：删除 Label 目录全套文件（JSON + 画笔 PNG + 图片副本），同步 UI
+        if not has_annotations:
+            self._delete_label_files(self.imagePath)
+            self.labelFile = None
+            self._update_file_row(self.imagePath, status="", labels="")
+            return True
+
         flags = {}
         for i in range(self.flag_widget.count()):  # type: ignore[union-attr]
             item = self.flag_widget.item(i)  # type: ignore[union-attr]
@@ -1865,12 +2272,16 @@ class MainWindow(QtWidgets.QMainWindow):
             flag = item.checkState() == Qt.Checked  # type: ignore[attr-defined,union-attr]
             flags[key] = flag
         try:
-            imagePath = osp.relpath(self.imagePath, osp.dirname(filename))  # type: ignore[arg-type]
+            # 确保 Label 目录存在
+            label_dir = self._ensure_label_dir(self.imagePath)
+            # JSON 保存路径：Label/<basename>.json
+            label_json = self._get_label_json_path(self.imagePath)
+            # JSON 中的 imagePath 记录图片文件名（与 JSON 同目录）
+            img_basename = osp.basename(self.imagePath)
+            imagePath = img_basename
             imageData = self.imageData if self._config["store_data"] else None
-            if osp.dirname(filename) and not osp.exists(osp.dirname(filename)):
-                os.makedirs(osp.dirname(filename))
             lf.save(
-                filename=filename,
+                filename=label_json,
                 shapes=shapes,
                 imagePath=imagePath,
                 imageData=imageData,
@@ -1879,18 +2290,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 otherData=self.otherData,
                 flags=flags,
             )
-            self.save_pixmap(osp.dirname(filename),imagePath)
+            # 将原图复制到 Label 目录（若 Label 目录中还没有）
+            label_img_copy = osp.join(label_dir, img_basename)
+            if not osp.exists(label_img_copy):
+                shutil.copy2(self.imagePath, label_img_copy)
+            # 保存画笔 PNG 到 Label 目录
+            label_png = self._get_label_png_path(self.imagePath)
+            self.canvas.pixmap2.save(label_png)
             self.labelFile = lf
-            items = self.fileListWidget.findItems(self.imagePath, Qt.MatchExactly)  # type: ignore[attr-defined]
-            if len(items) > 0:
-                if len(items) != 1:
-                    raise RuntimeError("There are duplicate files.")
-                if has_annotations:
-                    # 有矢量图形 或 有画笔，都视为“已标注”
-                    items[0].setCheckState(Qt.Checked)  # type: ignore[attr-defined]
-                else:
-                    # 既没有图形，也没有画笔 → 未标注
-                    items[0].setCheckState(Qt.Unchecked)  # type: ignore[attr-defined]
+            # 更新文件列表中该行的标注状态和已有标签
+            status = self.tr("已标注") if has_annotations else ""
+            labels = list({s["label"] for s in shapes})
+            labels_str = ",".join(sorted(labels)) if labels else ""
+            self._update_file_row(self.imagePath, status=status, labels=labels_str)
+            # 将本次保存用到的标签同步到 label.txt
+            for lbl in labels:
+                self._append_label_to_txt(self.imagePath, lbl)
 
             # disable allows next and previous image to proceed
             # self.filename = filename
@@ -2269,13 +2684,12 @@ class MainWindow(QtWidgets.QMainWindow):
         重置状态（清空已有数据）、禁用画布。
         """
         # changing fileListWidget loads file
-        if filename in self.imageList and (
-            self.fileListWidget.currentRow() != self.imageList.index(filename)
-        ):
-            # 如果展示图片与选中图片不一致的，则选中展示的图片所在行
-            self.fileListWidget.setCurrentRow(self.imageList.index(filename))
-            self.fileListWidget.repaint()
-            return
+        if filename in self.imageList:
+            row = self._find_file_row(filename)
+            if row >= 0 and self.fileListWidget.currentRow() != row:
+                self.fileListWidget.setCurrentCell(row, 2)
+                self.fileListWidget.repaint()
+                return
 
         self.resetState()
         self.canvas.setEnabled(False)
@@ -2289,13 +2703,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tr("No such file: <b>%s</b>") % filename,
             )
             return False
-        # assumes same name, but json extension
-        '''加载对应的标注文件'''
+        # 从 Label 目录读取对应的标注文件
         self.status(str(self.tr("Loading %s...")) % osp.basename(str(filename)))
-        label_file = osp.splitext(filename)[0] + ".json"  # 标注文件名
-        if self.output_dir:
-            label_file_without_path = osp.basename(label_file)   # basename只提取文件名字，去掉文件路径
-            label_file = osp.join(self.output_dir, label_file_without_path)
+        label_file = self._get_label_json_path(filename)
         if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
             try:
                 self.labelFile = LabelFile(label_file)
@@ -2311,10 +2721,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status(self.tr("Error reading %s") % label_file)
                 return False
             self.imageData = self.labelFile.imageData
-            self.imagePath = osp.join(
-                osp.dirname(label_file),  # 加载完整文件路径
-                self.labelFile.imagePath,  # type: ignore[arg-type]
-            )
+            # imageData 优先；若未嵌入则直接从原始图片路径读取
+            if self.imageData is None:
+                self.imageData = LabelFile.load_image_file(filename)
+            self.imagePath = filename
             self.otherData = self.labelFile.otherData
         else:
             self.imageData = LabelFile.load_image_file(filename)
@@ -2338,8 +2748,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.status(self.tr("Error reading %s") % filename)
             return False
-        # 加载保存的画笔mask
-        brush_mask_file_path = osp.splitext(filename)[0] + ".png"
+        # 从 Label 目录读取画笔 mask
+        brush_mask_file_path = self._get_label_png_path(filename)
         if QtCore.QFile.exists(brush_mask_file_path):
             brush_mask = QtGui.QImage(brush_mask_file_path)
         else:
@@ -2362,6 +2772,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.labelFile.flags is not None:
                 flags.update(self.labelFile.flags)
         self.loadFlags(flags)
+        # 从 label.txt 恢复该目录下全部标签历史（确保标签列表完整）
+        self._load_label_txt_to_dialog(filename)
         if self._config["keep_prev"] and self.noShapes():
             self.loadShapes(prev_shapes, replace=False)
             self.setDirty()
@@ -2415,6 +2827,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addRecentFile(self.filename)
         self.toggleActions(True)
         self.canvas.setFocus()
+        # 同步文件列表选中行
+        row = self._find_file_row(self.filename)
+        if row >= 0 and self.fileListWidget.currentRow() != row:
+            self.fileListWidget.blockSignals(True)
+            self.fileListWidget.setCurrentCell(row, 2)
+            self.fileListWidget.blockSignals(False)
         self.status(str(self.tr("Loaded %s")) % osp.basename(str(filename)))
         return True
 
@@ -2478,6 +2896,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("recentFiles", self.recentFiles)
         # ask the use for where to save the labels
         # self.settings.setValue('window/geometry', self.saveGeometry())
+
+    def eventFilter(self, obj, event):
+        """
+        1. 拦截文件列表的 Ctrl+C → 复制完整路径到剪切板。
+        2. 拦截文件菜单的鼠标释放 → 允许点击灰显的「自动保存」菜单项。
+        """
+        if obj is self.fileListWidget and event.type() == QtCore.QEvent.KeyPress:  # type: ignore[attr-defined]
+            if event.matches(QtGui.QKeySequence.Copy):  # type: ignore[attr-defined]
+                row = self.fileListWidget.currentRow()
+                path_item = self.fileListWidget.item(row, 2)
+                if path_item:
+                    QtWidgets.QApplication.clipboard().setText(path_item.text())
+                return True
+        if (
+            hasattr(self, "menus")
+            and obj is self.menus.file  # type: ignore[attr-defined]
+            and event.type() == QtCore.QEvent.MouseButtonRelease  # type: ignore[attr-defined]
+        ):
+            hit = self.menus.file.actionAt(event.pos())  # type: ignore[attr-defined]
+            if hit is not None and hasattr(self, "actions") and hit is self.actions.saveAuto and not hit.isEnabled():  # type: ignore[attr-defined]
+                # 灰显状态下点击：临时启用 → 触发切换 → 菜单关闭
+                hit.setEnabled(True)
+                hit.trigger()
+                self.menus.file.close()  # type: ignore[attr-defined]
+                return True
+        return super().eventFilter(obj, event)
 
     def dragEnterEvent(self, event):
         """处理文件拖入事件，如果拖入的是支持的图像格式，则接受事件"""
@@ -2596,36 +3040,35 @@ class MainWindow(QtWidgets.QMainWindow):
         filters = self.tr("Image & Label files (%s)") % " ".join(
             formats + ["*%s" % LabelFile.suffix]  # 支持图片和标注文件
         )
-        # 4. 🖼️ 创建文件选择对话框
-        # 创建带预览功能的文件对话框实例，将当前窗口作为父窗口
-        # 父窗口设置为self，确保对话框随父窗口关闭而关闭，且显示在父窗口上方
+
         fileDialog = FileDialogPreview(self)
-        # 设置文件选择模式：仅允许选择单个已存在的文件
-        # 避免用户选择目录、多个文件或不存在的文件，适合"打开文件"场景
+
         fileDialog.setFileMode(FileDialogPreview.ExistingFile)
-        # 设置文件类型过滤器，只显示符合条件的文件（如图片、标签文件）
-        # 减少无关文件干扰，降低用户选择错误类型的概率
+
         fileDialog.setNameFilter(filters)
-        # 设置对话框标题，通过self.tr()支持国际化翻译
-        # 明确告知用户对话框用途："[应用名] - 选择图片或标签文件"
+
         fileDialog.setWindowTitle(
             self.tr("%s - Choose Image or Label file") % __appname__,
         )
-        # 设置对话框打开时默认显示的路径（目录或文件）
-        # 直接定位到常用路径，减少用户导航目录的操作，提升效率
+
         fileDialog.setWindowFilePath(path)
-        # 设置文件显示模式为"详细信息模式"
-        # 显示文件名、大小、修改日期等信息，帮助用户快速识别目标文件
+
         fileDialog.setViewMode(FileDialogPreview.Detail)
-        # 5. 🎯 显示对话框并等待用户选择
+
         if fileDialog.exec_():
             fileName = fileDialog.selectedFiles()[0]  # 获取用户选择的文件
             if fileName:
-                # 6. 📥 加载选中的文件
+                # 切换到单张模式时，先清空文件列表和画布
+                self.fileListWidget.setRowCount(0)
+                self._update_file_count_label()
+                self.resetState()
+                self.canvas.setEnabled(False)
+                # 将图片添加到文件列表
+                self._add_file_row_to_table(fileName)
                 self.loadFile(fileName)
                 # 7. 禁用前后导航按钮（单文件模式）
                 self.actions.openNextImg.setEnabled(False)
-                self.actions.openPrevImg.setEnabled(False) # type: ignore[attr-defined]
+                self.actions.openPrevImg.setEnabled(False)  # type: ignore[attr-defined]
 
     def changeOutputDirDialog(self, _value=False):
         """弹出“更改输出目录”对话框"""
@@ -2658,22 +3101,21 @@ class MainWindow(QtWidgets.QMainWindow):
         current_filename = self.filename
         self.importDirImages(self.lastOpenDir, load=False)
 
-        if current_filename in self.imageList:
-            # retain currently selected file
-            self.fileListWidget.setCurrentRow(self.imageList.index(current_filename))
+        row = self._find_file_row(current_filename)
+        if row >= 0:
+            self.fileListWidget.setCurrentCell(row, 2)
             self.fileListWidget.repaint()
 
     def saveFile(self, _value=False):
-        """保存文件（智能判断保存路径）"""
+        """保存文件——始终保存到图片同级的 Label 目录"""
         assert not self.image.isNull(), "cannot save empty image"
-        if self.labelFile:
-            # DL20180323 - overwrite when in directory
-            self._saveFile(self.labelFile.filename)
-        elif self.output_file:
+        if self.output_file:
+            # 命令行指定了输出文件时才走旧路径
             self._saveFile(self.output_file)
             self.close()
         else:
-            self._saveFile(self.saveFileDialog())
+            # 始终保存到 <image_dir>/Label/<basename>.json
+            self._saveFile(self._get_label_json_path(self.filename))
 
     def saveFileAs(self, _value=False):
         """弹出“另存为”对话框来保存文件"""
@@ -2727,16 +3169,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setClean()
         self.toggleActions(False)
         self.canvas.setEnabled(False)
-        self.actions.saveAs.setEnabled(False)  # type: ignore[attr-defined]
 
     def getLabelFile(self):
-        """获取当前图像对应的标注文件名"""
-        if self.filename.lower().endswith(".json"):
-            label_file = self.filename
-        else:
-            label_file = osp.splitext(self.filename)[0] + ".json"
-
-        return label_file
+        """获取当前图像对应的标注文件路径（Label 目录中）"""
+        return self._get_label_json_path(self.filename)
 
     def deleteFile(self):
         """删除当前图像对应的标注文件"""
@@ -2748,14 +3184,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if answer != mb.Yes:
             return
 
-        label_file = self.getLabelFile()
-        if osp.exists(label_file):
-            os.remove(label_file)
-            logger.info("Label file is removed: {}".format(label_file))
-
-            item = self.fileListWidget.currentItem()
-            item.setCheckState(Qt.Unchecked)  # type: ignore[attr-defined,union-attr]
-
+        if self.filename and osp.exists(self.getLabelFile()):
+            self._delete_label_files(self.filename)
+            logger.info("Label files removed for: {}".format(self.filename))
+            self._update_file_row(self.imagePath, status="", labels="")
             self.resetState()
 
     def clearAllShapes(self):
@@ -2772,19 +3204,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if yes == QtWidgets.QMessageBox.warning(
                 self, self.tr("Attention"), msg, yes | no, yes
         ):
-            # 1. [核心修复] 清空右侧标签列表 UI
+            # 1. 清空右侧标签列表 UI
             self.labelList.clear()
 
-            # 2. [核心修复] 清空矢量图形 (必须加 replace=True)
+            # 2. 清空矢量图形
             self.canvas.loadShapes([], replace=True)
 
             # 3. 清空画笔绘制层 (Pen/Eraser)
             if self.canvas.pixmap2:
-                self.canvas.pixmap2.fill(Qt.transparent)
+                self.canvas.pixmap2.fill(Qt.transparent)  # type: ignore[attr-defined]
 
-            # 4. 强制刷新画布并标记为已修改
+            # 4. 同步删除 Label 目录中的全套文件（JSON + 画笔 PNG + 图片副本）
+            if self.imagePath:
+                self._delete_label_files(self.imagePath)
+                self.labelFile = None
+
+            # 5. 刷新画布、更新文件列表、标记为无待保存修改
             self.canvas.update()
-            self.setDirty()
+            self._sync_file_row_live()
+            self.setClean()
 
     # Message Dialogs. #
     def hasLabels(self):
@@ -2933,7 +3371,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:  # 若没有上次打开的目录或目录不存在
             defaultOpenDirPath = osp.dirname(self.filename) if self.filename else "."  # 用当前打开文件的所在目录，无则用当前目录
 
-        # 🎯 关键代码：创建并显示文件夹选择对话框
+
         targetDirPath = str(  # 将对话框返回的路径转为字符串（兼容不同系统路径格式）
             QtWidgets.QFileDialog.getExistingDirectory(  # 调用PyQt的文件夹选择对话框（仅选目录，不选文件）
                 self,  # 父窗口对象，确保对话框在当前窗口上方显示  通过将 self（MainWindow实例）作为父窗口参数传递  是Qt框架内置的功能
@@ -2954,12 +3392,241 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @property
     def imageList(self):
-        """以列表形式返回文件列表控件中的所有文件名"""
+        """以列表形式返回文件列表控件中的所有文件路径"""
         lst = []
-        for i in range(self.fileListWidget.count()):
-            item = self.fileListWidget.item(i)
-            lst.append(item.text())  # type: ignore[union-attr]
+        for i in range(self.fileListWidget.rowCount()):
+            path_item = self.fileListWidget.item(i, 2)
+            if path_item:
+                lst.append(path_item.text())
         return lst
+
+    # ------------------------------------------------------------------
+    # Label 目录约定：<image_dir>/Label/
+    # 所有标注 JSON、画笔 PNG 和图片副本均存于此目录
+    # ------------------------------------------------------------------
+    def _get_label_dir(self, image_path):
+        """返回 image_path 同级的 Label 目录路径（不创建）"""
+        return osp.join(osp.dirname(osp.abspath(image_path)), "Label")
+
+    def _get_label_json_path(self, image_path):
+        """返回对应的 JSON 标注文件路径"""
+        return osp.join(
+            self._get_label_dir(image_path),
+            osp.splitext(osp.basename(image_path))[0] + ".json",
+        )
+
+    def _get_painter_dir(self, image_path):
+        """返回画笔 PNG 存放目录：<image_dir>/Label/Painter/"""
+        return osp.join(self._get_label_dir(image_path), "Painter")
+
+    def _get_label_png_path(self, image_path):
+        """返回对应的画笔 PNG 路径（Label/Painter/<name>.png）"""
+        return osp.join(
+            self._get_painter_dir(image_path),
+            osp.splitext(osp.basename(image_path))[0] + ".png",
+        )
+
+    def _get_label_image_copy_path(self, image_path):
+        """返回 Label 目录中原图副本的路径：Label/<image_basename>"""
+        return osp.join(self._get_label_dir(image_path), osp.basename(image_path))
+
+    def _delete_label_files(self, image_path):
+        """删除 Label 目录中与 image_path 对应的全套文件（JSON + 画笔 PNG + 图片副本）"""
+        targets = (
+            self._get_label_json_path(image_path),
+            self._get_label_png_path(image_path),
+            self._get_label_image_copy_path(image_path),
+        )
+        for fpath in targets:
+            try:
+                if osp.exists(fpath):
+                    os.remove(fpath)
+            except Exception as e:
+                logger.warning("_delete_label_files: 删除失败 %s: %s", fpath, e)
+
+    def _ensure_label_dir(self, image_path):
+        """确保 Label 目录和 Label/Painter 子目录均存在，返回 Label 目录路径"""
+        label_dir = self._get_label_dir(image_path)
+        os.makedirs(label_dir, exist_ok=True)
+        os.makedirs(self._get_painter_dir(image_path), exist_ok=True)
+        return label_dir
+
+    # ------------------------------------------------------------------
+    # label.txt 相关辅助方法
+    # ------------------------------------------------------------------
+
+    def _get_label_txt_path(self, image_path):
+        """返回该图片所在目录的 Label/label.txt 路径"""
+        return osp.join(self._get_label_dir(image_path), "label.txt")
+
+    def _read_label_txt(self, image_path):
+        """读取 label.txt，返回标签名列表（去空行）"""
+        txt_path = self._get_label_txt_path(image_path)
+        if not osp.exists(txt_path):
+            return []
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                return [ln.strip() for ln in f if ln.strip()]
+        except Exception:
+            return []
+
+    def _append_label_to_txt(self, image_path, label):
+        """将新标签追加到 label.txt（已存在则跳过）"""
+        if not image_path or not label:
+            return
+        existing = self._read_label_txt(image_path)
+        if label in existing:
+            return
+        os.makedirs(self._get_label_dir(image_path), exist_ok=True)
+        try:
+            with open(self._get_label_txt_path(image_path), "a", encoding="utf-8") as f:
+                f.write(label + "\n")
+        except Exception:
+            pass
+
+    def _load_label_txt_to_dialog(self, image_path):
+        """从 label.txt 读取所有标签，同步到：
+        1. 标签对话框历史列表（弹出对话框内的候选列表）
+        2. 左侧 Label List 面板（uniqLabelList，用户直接可见的标签列表）
+        """
+        for label in self._read_label_txt(image_path):
+            # 1. 标签对话框历史
+            self.labelDialog.addLabelHistory(label)
+            # 2. 左侧唯一标签列表面板
+            if self.uniqLabelList.findItemByLabel(label) is None:
+                item = self.uniqLabelList.createItemFromLabel(label)
+                self.uniqLabelList.addItem(item)
+                rgb = self._get_rgb_by_label(label)
+                self.uniqLabelList.setItemLabel(item, label, rgb)
+                self.uniqLabelList.undate()
+
+    # ------------------------------------------------------------------
+
+    def _get_labels_from_json_file(self, label_file):
+        """从 json 标注文件中提取唯一的 label 类型（非 shape_type）"""
+        if not (QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file)):
+            return []
+        try:
+            lf = LabelFile(label_file)
+            labels = list({s["label"] for s in lf.shapes})
+            return sorted(labels)
+        except Exception:
+            return []
+
+    def _get_annotation_status(self, filename):
+        """判断图片是否已标注：查看 Label 目录中是否有对应的 JSON 标注"""
+        label_file = self._get_label_json_path(filename)
+        if not QtCore.QFile.exists(label_file):
+            return ""
+        if not LabelFile.is_label_file(label_file):
+            return ""
+        try:
+            lf = LabelFile(label_file)
+            if lf.shapes:
+                return self.tr("已标注")
+        except Exception:
+            pass
+        brush_file = self._get_label_png_path(filename)
+        if QtCore.QFile.exists(brush_file):
+            return self.tr("已标注")
+        return ""
+
+    _ANNOTATED_ROW_COLOR = QtGui.QColor(208, 228, 255)  # 淡蓝色
+
+    def _set_row_annotated_color(self, row, annotated: bool):
+        """设置行背景色：已标注→淡蓝，未标注→默认"""
+        color = self._ANNOTATED_ROW_COLOR if annotated else QtGui.QColor(QtCore.Qt.white)  # type: ignore[attr-defined]
+        for col in range(self.fileListWidget.columnCount()):
+            item = self.fileListWidget.item(row, col)
+            if item:
+                item.setBackground(color)
+
+    def _add_file_row_to_table(self, filename):
+        """向文件列表表格添加一行：编号、复选框、路径、标注状态、已有标签"""
+        row = self.fileListWidget.rowCount()
+        self.fileListWidget.insertRow(row)
+        # 列0：行编号（1-based，居中，只读）
+        num_item = QtWidgets.QTableWidgetItem(str(row + 1))
+        num_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # type: ignore[attr-defined]
+        num_item.setTextAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+        self.fileListWidget.setItem(row, 0, num_item)
+        # 列1：选中复选框（居中）
+        check_item = QtWidgets.QTableWidgetItem()
+        check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)  # type: ignore[attr-defined]
+        check_item.setCheckState(Qt.Unchecked)  # type: ignore[attr-defined]
+        check_item.setTextAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+        self.fileListWidget.setItem(row, 1, check_item)
+        # 列2：存完整路径（供内部逻辑使用），delegate 只渲染文件名，tooltip 显示完整路径
+        path_item = QtWidgets.QTableWidgetItem(filename)
+        path_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # type: ignore[attr-defined]
+        path_item.setToolTip(filename)
+        self.fileListWidget.setItem(row, 2, path_item)
+        # 列3：标注状态（居中）
+        status = self._get_annotation_status(filename)
+        status_item = QtWidgets.QTableWidgetItem(status)
+        status_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # type: ignore[attr-defined]
+        status_item.setTextAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
+        self.fileListWidget.setItem(row, 3, status_item)
+        # 列4：已有标签（从 Label 目录读取）
+        label_file = self._get_label_json_path(filename)
+        labels = self._get_labels_from_json_file(label_file)
+        labels_str = ",".join(labels) if labels else ""
+        labels_item = QtWidgets.QTableWidgetItem(labels_str)
+        labels_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # type: ignore[attr-defined]
+        self.fileListWidget.setItem(row, 4, labels_item)
+        # 已标注则整行染淡蓝色
+        self._set_row_annotated_color(row, bool(status))
+        # 更新底部计数
+        self._update_file_count_label()
+
+    def _sync_file_row_live(self):
+        """根据当前内存状态（不依赖磁盘文件）实时更新文件列表中当前图片的行。"""
+        if not self.imagePath:
+            return
+        labels = sorted({item.shape().label for item in self.labelList})
+        has_shapes = bool(labels)
+        has_brush = False
+        pm2 = getattr(self.canvas, "pixmap2", None)
+        if pm2 is not None and not pm2.isNull():
+            img = pm2.toImage()
+            ptr = img.bits()
+            ptr.setsize(img.byteCount())
+            arr = np.frombuffer(ptr, np.uint8)
+            has_brush = bool(arr.any())
+        has_annotations = has_shapes or has_brush
+        status = self.tr("已标注") if has_annotations else ""
+        labels_str = ",".join(labels) if labels else ""
+        self._update_file_row(self.imagePath, status=status, labels=labels_str)
+
+    def _update_file_count_label(self):
+        """更新底部计数标签"""
+        if hasattr(self, "fileCountLabel"):
+            n = self.fileListWidget.rowCount()
+            self.fileCountLabel.setText(self.tr(f"共 {n} 张"))
+
+    def _update_file_row(self, filename, status=None, labels=None):
+        """更新表格中某行的标注状态、已有标签及行背景色"""
+        for i in range(self.fileListWidget.rowCount()):
+            path_item = self.fileListWidget.item(i, 2)
+            if path_item and path_item.text() == filename:
+                if status is not None:
+                    status_item = self.fileListWidget.item(i, 3)
+                    if status_item:
+                        status_item.setText(status)
+                    self._set_row_annotated_color(i, bool(status))
+                if labels is not None:
+                    labels_item = self.fileListWidget.item(i, 4)
+                    if labels_item:
+                        labels_item.setText(labels)
+                return
+
+    def _find_file_row(self, filename):
+        """查找文件路径在表格中的行索引，不存在返回 -1"""
+        for i in range(self.fileListWidget.rowCount()):
+            path_item = self.fileListWidget.item(i, 2)
+            if path_item and path_item.text() == filename:
+                return i
+        return -1
 
     def importDroppedImageFiles(self, imageFiles):
         """导入拖放的图片文件"""
@@ -2972,17 +3639,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for file in imageFiles:
             if file in self.imageList or not file.lower().endswith(tuple(extensions)):
                 continue
-            label_file = osp.splitext(file)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
-            item = QtWidgets.QListWidgetItem(file)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # type: ignore[attr-defined]
-            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
-                item.setCheckState(Qt.Checked)  # type: ignore[attr-defined]
-            else:
-                item.setCheckState(Qt.Unchecked)  # type: ignore[attr-defined]
-            self.fileListWidget.addItem(item)
+            self._add_file_row_to_table(file)
 
         if len(self.imageList) > 1:
             self.actions.openNextImg.setEnabled(True)  # type: ignore[attr-defined]
@@ -2999,8 +3656,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 print("importDirImages的mayContinue")
                 return
         self.lastOpenDir = dirpath
+        # 切换目录时清空画布和所有状态，避免上一张图片残留
+        self.resetState()
+        self.canvas.setEnabled(False)
         self.filename = None
-        self.fileListWidget.clear()
+        self.fileListWidget.setRowCount(0)
+        self._update_file_count_label()
 
         filenames = self.scanAllImages(dirpath)
         if pattern:
@@ -3009,36 +3670,145 @@ class MainWindow(QtWidgets.QMainWindow):
             except re.error:
                 pass
         for filename in filenames:
-            label_file = osp.splitext(filename)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
-            item = QtWidgets.QListWidgetItem(filename)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # type: ignore[attr-defined]
-            # 如果有json文件，则设置为选中状态（表示已经完成标注）
-            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
-                item.setCheckState(Qt.Checked)  # type: ignore[attr-defined]
-            else:
-                item.setCheckState(Qt.Unchecked)  # type: ignore[attr-defined]
-
-            self.fileListWidget.addItem(item)
+            self._add_file_row_to_table(filename)
         self.openNextImg(load=load)
 
     def scanAllImages(self, folderPath):
-        """递归扫描指定文件夹下的所有支持的图片格式"""
-        # extensions = [
-        #     ".%s" % fmt.data().decode().lower()
-        #     for fmt in QtGui.QImageReader.supportedImageFormats()
-        # ]
-        extensions = [".jpg", ".jpeg"]  # 只扫描指定后缀格式的图片
+        """扫描 folderPath 顶级目录下的图片（不递归子目录，自动排除 Label/Painter 子文件夹）"""
+        extensions = (".jpg", ".jpeg", ".png")
         images = []
-        for root, dirs, files in os.walk(folderPath):
-            for file in files:
-                if file.lower().endswith(tuple(extensions)):
-                    relativePath = os.path.normpath(osp.join(root, file))
-                    images.append(relativePath)
+        # 只扫描顶级目录，不递归，避免把 Label/ 里的图片副本也扫进来
+        try:
+            entries = os.listdir(folderPath)
+        except OSError:
+            return images
+        for entry in entries:
+            full = os.path.normpath(osp.join(folderPath, entry))
+            if osp.isfile(full) and entry.lower().endswith(extensions):
+                images.append(full)
         images = natsort.os_sorted(images)
         return images
+
+    # ----------------------------------------------------------------------
+    # 导出 COCO / VOC 数据集
+    # ----------------------------------------------------------------------
+    def _get_checked_image_paths(self):
+        """获取文件列表中被勾选（列1复选框）的图片路径列表."""
+        paths = []
+        for i in range(self.fileListWidget.rowCount()):
+            check_item = self.fileListWidget.item(i, 1)
+            path_item = self.fileListWidget.item(i, 2)
+            if check_item and path_item and check_item.checkState() == Qt.Checked:
+                paths.append(path_item.text())
+        return paths
+
+    def _ask_export_directory(self, title: str, default_name: str) -> str | None:
+        """弹出对话框，选择导出根目录 + 子目录名，返回最终路径."""
+        base_dir = self.lastOpenDir or (osp.dirname(self.filename) if self.filename else ".")
+        base_dir = base_dir or "."
+        root = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            title,
+            base_dir,
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks,
+        )
+        if not root:
+            return None
+
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            title,
+            self.tr("Dataset folder name:"),
+            text=default_name,
+        )
+        if not ok or not name.strip():
+            return None
+        out_dir = osp.join(root, name.strip())
+        return out_dir
+
+    def _show_export_result(self, title: str, out_dir: str, result) -> None:
+        """根据导出统计结果弹出汇总对话框."""
+        lines = [self.tr("导出目录：{}").format(out_dir), ""]
+        lines.append(self.tr("✔ 成功导出：{} 张").format(result.success))
+        lines.append(self.tr("✘ 转换失败：{} 张").format(len(result.failed)))
+        lines.append(self.tr("○ 无标注跳过：{} 张").format(len(result.no_label)))
+
+        if result.failed:
+            lines.append("")
+            lines.append(self.tr("— 失败文件："))
+            for p in result.failed:
+                lines.append("  " + osp.basename(p))
+
+        if result.no_label:
+            lines.append("")
+            lines.append(self.tr("— 无标注文件："))
+            for p in result.no_label:
+                lines.append("  " + osp.basename(p))
+
+        msg = "\n".join(lines)
+
+        if result.success == 0:
+            QtWidgets.QMessageBox.warning(self, title, msg)
+        else:
+            QtWidgets.QMessageBox.information(self, title, msg)
+
+    def _export_checked_to_coco(self):
+        images = self._get_checked_image_paths()
+        if not images:
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.tr("Export COCO"),
+                self.tr("请先在文件列表中勾选要导出的图片。"),
+            )
+            return
+
+        out_dir = self._ask_export_directory(self.tr("Export COCO"), "coco_dataset")
+        if not out_dir:
+            return
+
+        try:
+            result = export_dataset.export_to_coco(
+                image_paths=images,
+                output_dir=out_dir,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("Export COCO"),
+                self.tr("导出 COCO 失败：{}").format(str(e)),
+            )
+            return
+
+        self._show_export_result(self.tr("Export COCO"), out_dir, result)
+
+    def _export_checked_to_voc(self):
+        images = self._get_checked_image_paths()
+        if not images:
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.tr("Export VOC"),
+                self.tr("请先在文件列表中勾选要导出的图片。"),
+            )
+            return
+
+        out_dir = self._ask_export_directory(self.tr("Export VOC"), "voc_dataset")
+        if not out_dir:
+            return
+
+        try:
+            result = export_dataset.export_to_voc(
+                image_paths=images,
+                output_dir=out_dir,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("Export VOC"),
+                self.tr("导出 VOC 失败：{}").format(str(e)),
+            )
+            return
+
+        self._show_export_result(self.tr("Export VOC"), out_dir, result)
 
     def select_item(self, index):
         """根据索引选中唯一标签列表中的项"""
@@ -3048,15 +3818,28 @@ class MainWindow(QtWidgets.QMainWindow):
             # label = item.data(Qt.UserRole)
             # print(f"Selected: {label}")
 
-    def emitCurrentItemChanged(self,item):
-        """当唯一标签列表选中项改变时，更新画布的当前标签和颜色"""
+    def emitCurrentItemChanged(self, item):
+        """当唯一标签列表选中项改变时，更新画布的当前标签和颜色。
+
+        注意：在没有任何标签（item 为 None）时，不应崩溃，而是清空当前标签状态。
+        """
+        if item is None:
+            # 启动时如果没有预设标签，允许画布当前标签为空
+            self.canvas.current_label = None
+            self.canvas.label_color = None
+            return
+
         label = item.data(QtCore.Qt.UserRole)
-        color = self.uniqLabelList.gender_color(label) if self.uniqLabelList.gender_color else None
-        self.canvas.current_label=label
+        color = (
+            self.uniqLabelList.gender_color(label)
+            if self.uniqLabelList.gender_color
+            else None
+        )
+        self.canvas.current_label = label
         self.canvas.label_color = color
-    def save_pixmap(self,imagePath,filename):
-        """保存画笔蒙版为png文件"""
-        self.canvas.pixmap2.save(os.path.join(imagePath,filename.split('.')[0]+'.png'))
+    def save_pixmap(self, imagePath, filename):
+        """已废弃：画笔 PNG 现由 saveLabels 直接保存到 Label 目录"""
+        pass
 
 
 

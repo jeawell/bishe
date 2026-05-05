@@ -1,6 +1,30 @@
 from PyQt5 import QtCore
 from PyQt5 import QtWidgets
 
+TOOLBAR_BUTTON_STYLE = """
+QToolButton {
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 3px;
+    background-color: transparent;
+}
+QToolButton:hover {
+    background-color: rgba(100, 170, 230, 0.25);
+    border: 1px solid rgba(100, 170, 230, 0.5);
+}
+QToolButton:pressed {
+    background-color: rgba(70, 140, 200, 0.40);
+    border: 1px solid rgba(70, 140, 200, 0.7);
+}
+QToolButton:checked {
+    background-color: rgba(70, 140, 200, 0.30);
+    border: 1px solid rgba(70, 140, 200, 0.6);
+}
+QToolButton:disabled {
+    opacity: 0.4;
+}
+"""
+
 
 class ToolBar(QtWidgets.QToolBar):
     def __init__(self, title):
@@ -18,6 +42,8 @@ class ToolBar(QtWidgets.QToolBar):
         btn = QtWidgets.QToolButton()
         btn.setDefaultAction(action)
         btn.setToolButtonStyle(self.toolButtonStyle())
+        btn.setFont(self.font())
+        btn.setStyleSheet(TOOLBAR_BUTTON_STYLE)
         self.addWidget(btn)
 
         # center align

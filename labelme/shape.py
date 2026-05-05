@@ -197,13 +197,6 @@ point_size, scale：点的大小和图像缩放比例。
         # --- 计算多边形 (polygon) 或 折线 (linestrip) 的质心 ---
         # (注意：折线的质心几何意义不大，但公式可用)
 
-        # 质心计算需要至少3个点才能形成有意义的面积
-        # if num_points < 3 and self.shape_type == 'polygon':
-        #    logger.warning(f"多边形 '{self.label}' 点数少于3，返回顶点平均值作为中心。")
-        #    sum_x = sum(p.x() for p in self.points)
-        #    sum_y = sum(p.y() for p in self.points)
-        #    return QtCore.QPointF(sum_x / num_points, sum_y / num_points)
-
         # 使用标准多边形质心公式 (适用于任意简单多边形)
         area = 0.0
         center_x = 0.0
@@ -261,6 +254,10 @@ point_size, scale：点的大小和图像缩放比例。
             logger.warning(f"旋转功能暂不支持 mask 类型的图形: {self.label}")
             # 或者 raise NotImplementedError("Rotation for mask shapes is not implemented.")
             return  # 暂时跳过 mask
+        # 圆形旋转后仍然是圆，不需要任何处理
+        if self.shape_type == 'circle':
+            return
+
 
         # 1. 将角度转换为弧度，因为 math 函数使用弧度
         angle_radians = math.radians(angle_degrees)
@@ -289,10 +286,9 @@ point_size, scale：点的大小和图像缩放比例。
 
         # 4. 用旋转后的点列表替换原来的点列表
         self.points = rotated_points
-
-        # 5. 重要：如果图形是矩形或圆形，旋转后它不再是严格意义上的矩形/圆形了
+        # 重要：如果图形是矩形，旋转后它不再是严格意义上的矩形了
         #    最好将其类型转换为多边形，以避免后续绘制或计算错误
-        if self.shape_type in ['rectangle', 'circle']:
+        if self.shape_type == 'rectangle':
             logger.info(f"图形 '{self.label}' 因旋转已从 '{self.shape_type}' 转换为 'polygon'")
             self.shape_type = 'polygon'
 
@@ -418,13 +414,13 @@ point_size, scale：点的大小和图像缩放比例。
                 QtCore.Qt.SmoothTransformation,  # type: ignore[attr-defined]
             )
             # 6. 使用 painter 将缩放后的 QImage 绘制到画布上，绘制的起始位置是 mask 的左上角坐标 (self.points[0])
-            painter.drawImage(self._scale_point(point=self.points[0]), qimage)  # 创建一个路径对象
+            painter.drawImage(self._scale_point(point=self.points[0]), qimage)
             # 7. (可选) 绘制 mask 的轮廓线
             line_path = QtGui.QPainterPath()
-            # 使用 skimage 找到 mask 的所有轮廓点
+            # 使用 skimage 找到 mask 的所有轮廓点，返回基于mask左上角的局部值
             contours = skimage.measure.find_contours(np.pad(self.mask, pad_width=1))
             for contour in contours:
-                # 将轮廓点坐标转换到画布坐标系 (加上 mask 左上角的偏移)
+                # 将轮廓点坐标转换到画布坐标系 (加上 mask 左上角的偏移)，因为使用了skimage
                 contour += [self.points[0].y(), self.points[0].x()]
                 # 从轮廓的第一个点开始
                 line_path.moveTo(
@@ -440,13 +436,12 @@ point_size, scale：点的大小和图像缩放比例。
 
         # --- 情况二：绘制基于点的图形 (多边形、矩形等) ---
         if self.points:
-            line_path = QtGui.QPainterPath()  # 创建用于绘制图形线条的路径对象
-            vrtx_path = QtGui.QPainterPath()  # 创建用于绘制普通顶点(正样本)的路径对象
-            negative_vrtx_path = QtGui.QPainterPath()  # 创建用于绘制负样本顶点的路径对象
-            # 根据不同的 shape_type 执行不同的绘制逻辑
-            if self.shape_type in ["rectangle", "mask"]:  # 矩形 或 mask (mask也需要画矩形框)
+            line_path = QtGui.QPainterPath()
+            vrtx_path = QtGui.QPainterPath()
+            negative_vrtx_path = QtGui.QPainterPath()
+            if self.shape_type in ["rectangle", "mask"]:
                 # 断言检查：点数必须是 1 或 2
-                assert len(self.points) in [1, 2]  # 如果有两个点 (已经画完了)
+                assert len(self.points) in [1, 2]
                 if len(self.points) == 2:
                     # 根据两个点创建矩形区域
                     rectangle = QtCore.QRectF(
@@ -459,6 +454,8 @@ point_size, scale：点的大小和图像缩放比例。
                     for i in range(len(self.points)):
                         # 调用 drawVertex 方法准备绘制每个顶点
                         self.drawVertex(vrtx_path, i)
+
+
             elif self.shape_type == "circle":  # 圆形
                 assert len(self.points) in [1, 2]
                 if len(self.points) == 2:  # 如果有两个点 (圆心和边缘点)
@@ -491,8 +488,7 @@ point_size, scale：点的大小和图像缩放比例。
                     else:   # 如果是负样本点 (label!=1)
                         self.drawVertex(negative_vrtx_path, i)# 准备绘制到负样本顶点路径
 
-            else:  # 其他类型，主要是 polygon (多边形) 和 line (直线)
-                # 移动到第一个点
+            else:
                 line_path.moveTo(self._scale_point(self.points[0]))
                 # Uncommenting the following line will draw 2 paths
                 # for the 1st vertex, and make it non-filled, which
@@ -532,10 +528,7 @@ point_size, scale：点的大小和图像缩放比例。
             painter.fillPath(negative_vrtx_path, QtGui.QColor(255, 0, 0, 255))
 
     def drawVertex(self, path, i):
-        """      绘制顶点
-                这是一个辅助函数，负责准备绘制第 i 个顶点到指定的路径对象 (path)。
-                它不直接绘制，而是将顶点的形状 (圆形或方形) 添加到 path 中。
-                """
+
         d = self.point_size  # 获取顶点的基础大小
         shape = self.point_type  # 获取顶点的默认形状 (圆形或方形)
         point = self._scale_point(self.points[i])  # 获取第 i 个顶点坐标并进行缩放
@@ -563,14 +556,7 @@ point_size, scale：点的大小和图像缩放比例。
 
     # --- 交互相关的方法 ---
     def nearestVertex(self, point, epsilon):
-        """
-                查找离给定点 point 最近的顶点。
-                参数:
-                    point: 用户鼠标点击或悬停的位置 (图像坐标)。
-                    epsilon: 一个小的距离阈值，只有当顶点与 point 的距离小于 epsilon 时才被认为是“靠近”。
-                返回:
-                    如果找到了靠近的顶点，返回该顶点的索引 (整数)；否则返回 None。
-                """
+
         min_distance = float("inf")
         min_i = None
         point = QtCore.QPointF(point.x() * self.scale, point.y() * self.scale)
@@ -583,11 +569,7 @@ point_size, scale：点的大小和图像缩放比例。
         return min_i
 
     def nearestEdge(self, point, epsilon):
-        """
-                查找离给定点 point 最近的边。
-                返回:
-                    如果找到了靠近的边，返回这条边结束点的索引 (整数)；否则返回 None。
-        """
+
         min_distance = float("inf")
         post_i = None
         point = QtCore.QPointF(point.x() * self.scale, point.y() * self.scale)
@@ -604,9 +586,7 @@ point_size, scale：点的大小和图像缩放比例。
         return post_i
 
     def containsPoint(self, point):
-        """
-                检查给定的点 point 是否位于这个图形的内部。
-        """
+
         if self.mask is not None:
             y = np.clip(
                 int(round(point.y() - self.points[0].y())),
@@ -622,11 +602,6 @@ point_size, scale：点的大小和图像缩放比例。
         return self.makePath().contains(point)
 
     def makePath(self):
-        """
-                根据图形的类型 (self.shape_type) 和顶点列表 (self.points)，
-                创建一个 PyQt 的 QPainterPath 对象。
-                QPainterPath 是 PyQt 中表示复杂二维形状的标准方式。
-                """
         if self.shape_type in ["rectangle", "mask"]:
             path = QtGui.QPainterPath()
             if len(self.points) == 2:
@@ -643,48 +618,27 @@ point_size, scale：点的大小和图像缩放比例。
         return path
 
     def boundingRect(self):
-        """
-                计算并返回能够完整包围这个图形的最小矩形 (Bounding Rectangle)。
-                """
-        return self.makePath().boundingRect()
+        #计算并返回能够完整包围这个图形的最小矩形 (Bounding Rectangle)。
+        return self.makePath().boundingRect() #QPainterPath.boundingRect()
 
     def moveBy(self, offset):
-        """
-                将整个图形移动指定的偏移量。
-                参数 offset 是一个 QPointF 对象，表示 x 和 y 方向的移动距离。
-                """
+
         # 使用列表推导式，对 self.points 列表中的每一个点 p，都加上偏移量 offset
         # 然后用这个新的点列表替换掉旧的 self.points 列表
         self.points = [p + offset for p in self.points]
 
     def moveVertexBy(self, i, offset):
-        """
-                只移动图形中指定索引 i 的顶点。
-                """
         # 直接修改 self.points 列表中第 i 个顶点的值，让它等于原来的值加上偏移量 offset
         self.points[i] = self.points[i] + offset
 
     # --- 高亮相关的方法 ---
     def highlightVertex(self, i, action):
-        """
-                设置要高亮显示的顶点及其高亮模式。
-                参数:
-                    i (int): 要高亮的顶点的索引。
-                    action (int): 高亮模式 (MOVE_VERTEX 或 NEAR_VERTEX)。
-                """
-        """Highlight a vertex appropriately based on the current action
 
-        Args:
-            i (int): The vertex index
-            action (int): The action
-            (see Shape.NEAR_VERTEX and Shape.MOVE_VERTEX)
-        """
         self._highlightIndex = i
         self._highlightMode = action
 
     def highlightClear(self):
-        """清除所有顶点的高亮状态"""
-        """Clear the highlighted point"""
+
         self._highlightIndex = None
 
     def copy(self):

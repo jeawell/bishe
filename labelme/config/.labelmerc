@@ -1,6 +1,6 @@
-auto_save: false
+auto_save: True
 display_label_popup: false
-store_data: true
+store_data: False
 keep_prev: false
 keep_prev_scale: false
 keep_prev_brightness: false

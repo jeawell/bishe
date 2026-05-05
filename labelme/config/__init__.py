@@ -33,8 +33,9 @@ def get_default_config():
         config = yaml.safe_load(f)
 
     # 构建用户主目录下的配置文件路径
-    user_config_file = osp.join(osp.expanduser("~"), ".labelmerc")
-
+    # user_config_file = osp.join(osp.expanduser("~"), ".labelmerc")
+    # 构建存储在项目中随项目移动的个人配置
+    user_config_file = osp.join(here, ".labelmerc")
     # 如果用户配置文件不存在，则创建它
     if not osp.exists(user_config_file):
         try:

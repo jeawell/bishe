@@ -4,7 +4,7 @@ import contextlib  # 提供了一些用于处理上下文的工具，如此处�
 import os
 import os.path as osp
 import sys
-
+#os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import yaml  # 用于读取和解析YAML格式的配置文件
 from loguru import logger  # 一个功能强大的日志记录库
 from PyQt5 import QtCore  # PyQt5的核心模块，包含信号与槽机制等
@@ -81,7 +81,9 @@ def main():
         "recognized as file, else as directory)",
     )
     # 设置默认配置文件的路径
-    default_config_file = os.path.join(os.path.expanduser("~"), ".labelmerc")   #
+    # default_config_file = os.path.join(os.path.expanduser("~"), ".labelmerc")
+    here = osp.dirname(osp.abspath(__file__))
+    default_config_file = os.path.join(here,"config/.labelmerc")
     parser.add_argument(
         "--config",
         dest="config",
@@ -215,7 +217,7 @@ def main():
     # 创建Qt应用实例
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(__appname__)
-    app.setWindowIcon(newIcon("icon"))
+    app.setWindowIcon(newIcon("newicon"))
     app.installTranslator(translator)
     # 创建主窗口实例，并传入所有配置
     win = MainWindow(

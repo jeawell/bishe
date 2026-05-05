@@ -4,7 +4,9 @@ from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPalette
 from PyQt5.QtWidgets import QStyle
-
+"""
+多边形标签列表
+"""
 
 # https://stackoverflow.com/a/2039745/4158863
 class HTMLDelegate(QtWidgets.QStyledItemDelegate):
@@ -68,12 +70,12 @@ class HTMLDelegate(QtWidgets.QStyledItemDelegate):
 class LabelListWidgetItem(QtGui.QStandardItem):
     def __init__(self, text=None, shape=None):
         super(LabelListWidgetItem, self).__init__()
-        self.setText(text or "")
+        self.setText(text or "这是labellistweigetitem")
         self.setShape(shape)
 
-        self.setCheckable(True)
+        self.setCheckable(1)
         self.setCheckState(Qt.Checked)  # type: ignore[attr-defined]
-        self.setEditable(False)
+        self.setEditable(0)
         self.setTextAlignment(Qt.AlignBottom)  # type: ignore[attr-defined]
 
     def clone(self):
@@ -127,7 +129,7 @@ class LabelListWidget(QtWidgets.QListView):
         self.setDefaultDropAction(Qt.MoveAction)  # type: ignore[attr-defined]
         # 连接双击事件到自定义处理函数
         self.doubleClicked.connect(self.itemDoubleClickedEvent)
-        # 连接选择变化事件到自定义处理函数
+        # 连接选择变化事件到自定义处理函数，selectionModel 才是管理选中状态的对象
         self.selectionModel().selectionChanged.connect(self.itemSelectionChangedEvent)  # type: ignore[union-attr]
 
     # 获取列表长度（项目数量）
@@ -143,7 +145,7 @@ class LabelListWidget(QtWidgets.QListView):
         for i in range(len(self)):
             yield self[i]
 
-    # 属性：获取项目拖放完成信号
+    # 属性：获取项目拖放完成信号，把 model 的信号“转发”出来，让 LabelListWidget 看起来像自己拥有这些信号一样
     @property
     def itemDropped(self):
         return self.model().itemDropped  # type: ignore[union-attr]
@@ -167,7 +169,7 @@ class LabelListWidget(QtWidgets.QListView):
         # 发射自定义的双击信号，参数为被双击的项目
         self.itemDoubleClicked.emit(self.model().itemFromIndex(index))  # type: ignore[union-attr]
 
-    # 选中指定项目
+    # 返回已选中的项目
     def selectedItems(self):
         return [self.model().itemFromIndex(i) for i in self.selectedIndexes()]  # type: ignore[union-attr]
 

@@ -7,8 +7,11 @@ from PyQt5 import QtWidgets
 
 import labelme.utils
 
+"""
+确认标签弹出对话框
+"""
 # TODO(unknown):
-# - Calculate optimal position so as not to go out of screen area.
+# - Calculate optimal position so as not to go out of screen area.计算最佳位置，以避免超出屏幕区域
 
 
 class LabelQLineEdit(QtWidgets.QLineEdit):
@@ -25,7 +28,7 @@ class LabelQLineEdit(QtWidgets.QLineEdit):
 class LabelDialog(QtWidgets.QDialog):
     def __init__(
             self,
-            text="Enter object label",  # 输入框的占位符文本
+            text="输入标签名称",  # 输入框的占位符文本
             parent=None,  # 父窗口
             labels=None,  # 可选的标签列表
             sort_labels=True,  # 是否对标签排序
@@ -35,7 +38,7 @@ class LabelDialog(QtWidgets.QDialog):
             flags=None,  # 标签标志选项
             shortcuts=None  # 快捷键设置
     ):
-        # ，设置内容适应选项默认为列适应
+        # 设置内容适应选项默认为列适应
         if fit_to_content is None:
             fit_to_content = {"row": False, "column": True}
         self._fit_to_content = fit_to_content
@@ -57,9 +60,7 @@ class LabelDialog(QtWidgets.QDialog):
 
         # 创建组ID输入框
         self.edit_group_id = QtWidgets.QLineEdit()
-        # 设置组ID输入框的占位符文本
-        self.edit_group_id.setPlaceholderText("Group ID")
-        # 设置组ID的验证器，只允许输入数字
+        self.edit_group_id.setPlaceholderText("组id")
         self.edit_group_id.setValidator(
             QtGui.QRegExpValidator(QtCore.QRegExp(r"\d*"), None)
         )
@@ -134,21 +135,21 @@ class LabelDialog(QtWidgets.QDialog):
         self._flags = flags
         # 创建标志选项布局
         self.flagsLayout = QtWidgets.QVBoxLayout()
-        # 重置标志选项
-        self.resetFlags()
-        # 将标志布局添加到主布局
-        layout.addItem(self.flagsLayout)
-        # 连接文本变化信号到更新标志函数
-        self.edit.textChanged.connect(self.updateFlags)
 
-        # 创建标签描述文本框
-        self.editDescription = QtWidgets.QTextEdit()
-        # 设置描述文本框的占位符文本
-        self.editDescription.setPlaceholderText("Label description")
-        # 设置描述文本框的固定高度
-        self.editDescription.setFixedHeight(50)
-        # 将描述文本框添加到主布局
-        layout.addWidget(self.editDescription)
+        self.resetFlags()# 重置标志选项
+
+        layout.addItem(self.flagsLayout)# 将标志布局添加到主布局
+
+        self.edit.textChanged.connect(self.updateFlags)# 连接文本变化信号到更新标志函数
+
+
+        self.editDescription = QtWidgets.QTextEdit() # 创建标签描述文本框
+
+        self.editDescription.setPlaceholderText("标签描述")# 设置描述文本框的占位符文本
+
+        self.editDescription.setFixedHeight(50)# 设置描述文本框的固定高度
+
+        layout.addWidget(self.editDescription)# 将描述文本框添加到主布局
 
         # 设置对话框的主布局
         self.setLayout(layout)
@@ -159,8 +160,8 @@ class LabelDialog(QtWidgets.QDialog):
         if completion == "startswith":
             # 内联补全模式（在输入框内直接显示补全）
             completer.setCompletionMode(QtWidgets.QCompleter.InlineCompletion)  # type: ignore[attr-defined]
-            # 默认使用前缀匹配（注释掉了，使用系统默认）
-            # completer.setFilterMode(QtCore.Qt.MatchStartsWith)
+            # 默认使用前缀匹配（注释掉了，系统默认就是这个）
+            completer.setFilterMode(QtCore.Qt.MatchStartsWith)
         elif completion == "contains":
             # 弹出式补全模式
             completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)  # type: ignore[attr-defined]

@@ -1,0 +1,1 @@
+修改canvas，调整sam模型触发方式，多线程异步，从paintevent事件移除原有触发逻辑。
