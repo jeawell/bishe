@@ -1,5 +1,8 @@
 /.cache/
 /.pytest_cache/
+/.venv/
+/labelme_fixed/
+__pycache__/
 
 /build/
 /dist/

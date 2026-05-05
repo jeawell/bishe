@@ -65,6 +65,79 @@ class _PathColumnDelegate(QtWidgets.QStyledItemDelegate):
         if full_path:
             option.text = osp.basename(full_path)
 
+
+class _CheckBoxHeader(QtWidgets.QHeaderView):
+    """在指定表头列放置一个真实的复选框控件。"""
+
+    checkStateChanged = QtCore.pyqtSignal(int)
+
+    def __init__(self, orientation, parent=None, checkable_section=1):
+        super().__init__(orientation, parent)
+        self._checkable_section = checkable_section
+        self._check_state = Qt.Unchecked  # type: ignore[attr-defined]
+        self.setSectionsClickable(True)
+        self._checkbox = QtWidgets.QCheckBox(self.viewport())
+        self._checkbox.setTristate(True)
+        self._checkbox.setFocusPolicy(Qt.NoFocus)  # type: ignore[attr-defined]
+        self._checkbox.setStyleSheet("background: transparent; margin: 0px;")
+        self._checkbox.stateChanged.connect(self._on_checkbox_state_changed)
+        self.sectionResized.connect(lambda *_: self._update_checkbox_geometry())
+        self.sectionMoved.connect(lambda *_: self._update_checkbox_geometry())
+        self.geometriesChanged.connect(self._update_checkbox_geometry)
+        self._update_checkbox_geometry()
+
+    def checkState(self):
+        return self._check_state
+
+    def setCheckState(self, state):
+        if self._check_state == state:
+            return
+        self._check_state = state
+        self._checkbox.blockSignals(True)
+        self._checkbox.setCheckState(state)
+        self._checkbox.blockSignals(False)
+        self.updateSection(self._checkable_section)
+
+    def _on_checkbox_state_changed(self, state):
+        if state == Qt.PartiallyChecked:  # type: ignore[attr-defined]
+            state = Qt.Checked  # type: ignore[attr-defined]
+            self._checkbox.blockSignals(True)
+            self._checkbox.setCheckState(state)
+            self._checkbox.blockSignals(False)
+        self._check_state = state
+        self.checkStateChanged.emit(state)
+
+    def _update_checkbox_geometry(self):
+        x = self.sectionViewportPosition(self._checkable_section)
+        width = self.sectionSize(self._checkable_section)
+        size = self._checkbox.sizeHint()
+        self._checkbox.setGeometry(
+            x + (width - size.width()) // 2,
+            (self.height() - size.height()) // 2,
+            size.width(),
+            size.height(),
+        )
+        self._checkbox.raise_()
+        self._checkbox.show()
+
+    def mousePressEvent(self, event):
+        if self.logicalIndexAt(event.pos()) == self._checkable_section:
+            state = (
+                Qt.Unchecked  # type: ignore[attr-defined]
+                if self._check_state == Qt.Checked  # type: ignore[attr-defined]
+                else Qt.Checked  # type: ignore[attr-defined]
+            )
+            self.setCheckState(state)
+            self.checkStateChanged.emit(state)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_checkbox_geometry()
+
+
 class _AdaptiveSection(QtWidgets.QScrollArea):
     """
     工具栏区段容器：
@@ -251,6 +324,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fileSearch.textChanged.connect(self.fileSearchChanged) # 文本改变时触发搜索
         # 文件列表改用 QTableWidget，五列：编号、选中复选框、文件路径、标注状态、已有标签
         self.fileListWidget = QtWidgets.QTableWidget()
+        self._updating_file_checks = False
+        self.fileListHeader = _CheckBoxHeader(
+            QtCore.Qt.Horizontal, self.fileListWidget, checkable_section=1
+        )
+        self.fileListWidget.setHorizontalHeader(self.fileListHeader)
         self.fileListWidget.setColumnCount(5)
         self.fileListWidget.setHorizontalHeaderLabels([
             self.tr("id"),      # 编号
@@ -289,6 +367,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 行高也随之紧凑
         self.fileListWidget.verticalHeader().setDefaultSectionSize(20)
         self.fileListWidget.itemSelectionChanged.connect(self.fileSelectionChanged)
+        self.fileListWidget.itemChanged.connect(self._update_file_header_check_state)
+        self.fileListHeader.checkStateChanged.connect(self._set_all_file_checks)
 
         # 创建一个垂直布局管理器（QVBoxLayout）
         fileListLayout = QtWidgets.QVBoxLayout()# 垂直布局会按从上到下的顺序排列子控件
@@ -3061,6 +3141,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # 切换到单张模式时，先清空文件列表和画布
                 self.fileListWidget.setRowCount(0)
                 self._update_file_count_label()
+                self._update_file_header_check_state()
                 self.resetState()
                 self.canvas.setEnabled(False)
                 # 将图片添加到文件列表
@@ -3541,6 +3622,47 @@ class MainWindow(QtWidgets.QMainWindow):
             if item:
                 item.setBackground(color)
 
+    def _set_all_file_checks(self, state):
+        """表头复选框触发：批量勾选或取消所有文件行。"""
+        self._updating_file_checks = True
+        try:
+            target_state = (
+                Qt.Checked  # type: ignore[attr-defined]
+                if state == Qt.Checked  # type: ignore[attr-defined]
+                else Qt.Unchecked  # type: ignore[attr-defined]
+            )
+            for row in range(self.fileListWidget.rowCount()):
+                check_item = self.fileListWidget.item(row, 1)
+                if check_item is not None:
+                    check_item.setCheckState(target_state)
+        finally:
+            self._updating_file_checks = False
+        self._update_file_header_check_state()
+
+    def _update_file_header_check_state(self, item=None):
+        """根据每行复选框状态同步表头：全选、未选、半选。"""
+        if getattr(self, "_updating_file_checks", False):
+            return
+        if item is not None and item.column() != 1:
+            return
+        if not hasattr(self, "fileListHeader"):
+            return
+
+        total = self.fileListWidget.rowCount()
+        checked = 0
+        for row in range(total):
+            check_item = self.fileListWidget.item(row, 1)
+            if check_item is not None and check_item.checkState() == Qt.Checked:  # type: ignore[attr-defined]
+                checked += 1
+
+        if total == 0 or checked == 0:
+            state = Qt.Unchecked  # type: ignore[attr-defined]
+        elif checked == total:
+            state = Qt.Checked  # type: ignore[attr-defined]
+        else:
+            state = Qt.PartiallyChecked  # type: ignore[attr-defined]
+        self.fileListHeader.setCheckState(state)
+
     def _add_file_row_to_table(self, filename):
         """向文件列表表格添加一行：编号、复选框、路径、标注状态、已有标签"""
         row = self.fileListWidget.rowCount()
@@ -3578,6 +3700,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_row_annotated_color(row, bool(status))
         # 更新底部计数
         self._update_file_count_label()
+        self._update_file_header_check_state()
 
     def _sync_file_row_live(self):
         """根据当前内存状态（不依赖磁盘文件）实时更新文件列表中当前图片的行。"""
@@ -3662,6 +3785,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filename = None
         self.fileListWidget.setRowCount(0)
         self._update_file_count_label()
+        self._update_file_header_check_state()
 
         filenames = self.scanAllImages(dirpath)
         if pattern:
